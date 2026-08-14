@@ -406,6 +406,13 @@ function normalizeBody(buffer, contentType, route) {
   } else if (model.requestProfile === "deepseek-nonthinking") {
     payload.thinking = { type: "disabled" };
     delete payload.reasoning_effort;
+  } else if (model.requestProfile === "deepseek-force-max") {
+    // Command Code and opencode Go DeepSeek V4 flash/pro are pinned to the
+    // model's max reasoning tier on every request. The picker keeps its
+    // normal levels and the operator selects "high", but the upstream always
+    // sees max. LiteLLM can drop the inbound field entirely, so never depend
+    // on the caller-supplied value.
+    payload.reasoning_effort = "max";
   } else if (
     ["ollama-cloud", "ollama-cloud-auto-tool-choice"].includes(model.requestProfile)
   ) {

@@ -11,6 +11,7 @@
       "description": "DeepSeek V4 Pro through the opencode Go subscription.",
       "priority": 36,
       "defaultEffort": "high",
+      "requestProfile": "deepseek-force-max",
       "reasoningLevels": [
         {
           "effort": "high",

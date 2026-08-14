@@ -11,6 +11,7 @@
       "description": "DeepSeek V4 Flash through the opencode Go subscription.",
       "priority": 37,
       "defaultEffort": "high",
+      "requestProfile": "deepseek-force-max",
       "reasoningLevels": [
         {
           "effort": "low",

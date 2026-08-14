@@ -11,6 +11,7 @@
       "description": "DeepSeek V4 Pro through the Command Code Provider API.",
       "priority": 101,
       "defaultEffort": "high",
+      "requestProfile": "deepseek-force-max",
       "reasoningLevels": [
         {
           "effort": "high",
