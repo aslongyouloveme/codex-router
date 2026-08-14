@@ -13,3 +13,5 @@ apps/desktop/src-tauri/icons/StoreLogo.png
 apps/desktop/src-tauri/icons/icon.icns
 *.log
 *.tmp
+.idea/
+Codex_Router_CommandCode_Proxy_运维记录.docx
