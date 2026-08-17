@@ -8,7 +8,7 @@ import { detectLegacyInstallations, applyKnownMigrations, rollbackLatestMigratio
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { PROVIDERS } from "./model-registry.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
-import { SOURCE_ROOT } from "./paths.mjs";
+import { SOURCE_ROOT, TARGET } from "./paths.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
 import {
   hasSignInCli,
@@ -19,11 +19,12 @@ import {
 } from "./provider-onboarding.mjs";
 import { renderProviderChoices, stepHeader, toggleSelection } from "./setup-ui.mjs";
 import {
-  configuredProviderIds,
+  defaultProviderIds,
   selectedConfiguredListedModels,
   validateProviderIds,
   writeProviderSelection,
 } from "./provider-selection.mjs";
+import { writeDiscoveryMode } from "./discovery-mode.mjs";
 import { trayBundleDir, trayDecision } from "./tray-install.mjs";
 import { resolveVisionEngine } from "./vision-bridge.mjs";
 import {
@@ -39,6 +40,8 @@ const runSmoke = args.includes("--smoke-test");
 const selectionOnly = args.includes("--selection-only");
 const withTray = args.includes("--with-tray");
 const noTray = args.includes("--no-tray");
+const noProvider = args.includes("--no-provider");
+const noDiscovery = args.includes("--no-discovery");
 
 const flagOptions = new Set([
   "--guided",
@@ -49,6 +52,8 @@ const flagOptions = new Set([
   "--selection-only",
   "--with-tray",
   "--no-tray",
+  "--no-provider",
+  "--no-discovery",
   "--help",
 ]);
 let setupArgumentError;
@@ -68,6 +73,31 @@ for (let index = 0; index < args.length; index += 1) {
 if (!setupArgumentError && migrateKnown && adoptNativeCatalog) {
   setupArgumentError =
     "--adopt-native-catalog cannot be combined with --migrate-known.";
+}
+// An idle install is exactly "no providers": naming providers, answering the
+// guided picker, or pasting keys alongside it is a contradiction to report,
+// not to guess about. And --no-discovery without --no-provider would select
+// providers that can never authenticate, so the narrower flag requires the
+// wider one.
+if (!setupArgumentError && noProvider && (guided || args.includes("--providers"))) {
+  setupArgumentError = `--no-provider cannot be combined with ${
+    guided ? "--guided" : "--providers"
+  }.`;
+}
+if (!setupArgumentError && noDiscovery && !noProvider) {
+  setupArgumentError = "--no-discovery requires --no-provider.";
+}
+// Children (bin/install, the catalog build, the doctor) must honor the choice
+// before the marker file exists -- and a re-run without the flag must clear a
+// stale environment value just as writeDiscoveryMode clears the marker.
+process.env.CODEX_ROUTER_NO_DISCOVERY = noDiscovery ? "1" : "0";
+// Both act on Codex's own configuration: one replaces an older router's
+// managed block, the other adopts the ChatGPT-plan catalog Codex reads. The
+// harness integration is one settings section and has neither.
+if (!setupArgumentError && TARGET !== "codex" && (migrateKnown || adoptNativeCatalog)) {
+  setupArgumentError = `${
+    migrateKnown ? "--migrate-known" : "--adopt-native-catalog"
+  } applies only to the Codex target.`;
 }
 
 function option(name) {
@@ -106,6 +136,9 @@ Options:
   --selection-only     Save provider selection without installing (development)
   --with-tray          Also build and launch the desktop companion app
   --no-tray            Never offer the desktop companion app
+  --no-provider        Install idle, with no provider selected or configured
+  --no-discovery       With --no-provider: never read credentials, the
+                       Keychain, or other CLIs' sessions; refuse traffic locally
   --help               Show this help
 
 Providers: ${[...PROVIDERS.values()].filter((provider) => !provider.variantOf).map((provider) => provider.id).join(", ")}
@@ -169,7 +202,9 @@ function providerConfigured(provider) {
     if (provider.id === "grok-oauth") return grokOAuthStatus().configured;
     return false;
   }
-  return credentialStatus(provider, { persistent: true }).configured;
+  return provider.keyless || provider.authMode === "anonymous"
+    ? true
+    : credentialStatus(provider, { persistent: true }).configured;
 }
 
 const colorEnabled = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
@@ -200,13 +235,16 @@ function guidedSelection() {
 }
 
 function requestedSelection() {
+  // The idle install asks for nothing, so nothing is scanned to find it: the
+  // defaultProviderIds() fallback below is itself a full credential sweep.
+  if (noProvider) return [];
   const requested = option("--providers");
   if (requested) {
-    if (requested === "configured") return configuredProviderIds();
+    if (requested === "configured") return defaultProviderIds();
     if (requested === "all") return [...PROVIDERS.keys()];
     return validateProviderIds(requested.split(","));
   }
-  return guided ? guidedSelection() : configuredProviderIds();
+  return guided ? guidedSelection() : defaultProviderIds();
 }
 
 function run(command, commandArgs, options = {}) {
@@ -253,6 +291,7 @@ function configureProvider(provider) {
       throw incomplete(`${provider.displayName} sign-in did not produce a usable credential.`);
     }
   } else {
+    if (provider.authMode === "anonymous") return;
     // A provider whose CLI mints its key in the browser gets that offer first,
     // because most people have an account long before they have a key. Saying
     // no falls through to the key prompt rather than failing the install.
@@ -297,6 +336,23 @@ function installTray() {
       run(path.join(SOURCE_ROOT, "scripts", "build-macos-tray-app.sh"), [bundleDir]);
       run("open", [bundleDir]);
       process.stdout.write(`Menu-bar companion installed at ${bundleDir} and opened.\n`);
+    } else if (process.platform === "win32") {
+      // Windows had no path through here at all: the tray was built by hand or
+      // not at all, and nothing brought it back after a reboot. `tray install`
+      // builds when the sources moved, stamps the build, and registers the
+      // logon task that starts it now and at every logon -- the same entry
+      // point a user runs by hand, so the sequence exists once instead of
+      // drifting between the installer and the CLI.
+      run("powershell.exe", [
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        path.join(SOURCE_ROOT, "codex-router.ps1"),
+        "tray",
+        "install",
+      ]);
     } else {
       run(path.join(SOURCE_ROOT, "bin", "model-router-tray"), []);
       process.stdout.write("Desktop companion built and launched.\n");
@@ -307,7 +363,13 @@ function installTray() {
         (process.platform === "darwin"
           ? "Recent macOS SDKs need the full Xcode app (not only the Command Line Tools) to build the menu-bar companion's SwiftUI macros.\n"
           : "") +
-        "The router itself is installed; retry later with ./bin/model-router-tray.\n",
+        (process.platform === "win32"
+          ? "The router itself is installed; retry later with .\\codex-router.ps1 tray,\n" +
+            "or .\\codex-router.ps1 companion for the Electron build, which needs no Rust.\n"
+          : "The router itself is installed; retry later with ./bin/model-router-tray.\n") +
+        // Nothing to build and nothing to download, so it is the one suggestion
+        // that cannot fail for the same reason this just did.
+        "The companion also runs in a browser: .\\codex-router.ps1 panel (./bin/panel on macOS and Linux).\n",
     );
   }
 }
@@ -343,7 +405,7 @@ async function main() {
       ? error
       : incomplete(error instanceof Error ? error.message : String(error));
   }
-  if (providers.length === 0) {
+  if (providers.length === 0 && !noProvider) {
     throw incomplete(
       "No configured provider was found. Run `./bin/setup --guided` or pass `--providers` after configuring credentials.",
     );
@@ -368,6 +430,10 @@ async function main() {
     }
   }
   writeProviderSelection(providers);
+  // Written on every run, not only idle ones: re-running setup without
+  // --no-discovery is the exit path from idle mode, so a normal install must
+  // clear the marker just as an idle install sets it.
+  writeDiscoveryMode(noDiscovery);
 
   // Pasted images just work for text-only models: the bridge is on by default,
   // so the installer no longer writes anything here. It used to auto-enable
@@ -406,13 +472,16 @@ async function main() {
   }
 
   nextStep("Review and install");
+  const dshTarget = TARGET === "dsh";
   if (guided) {
     process.stdout.write(
       `\nReady to install:\n` +
-        `  Providers: ${providers.join(", ")}\n` +
+        `  Providers: ${providers.length ? providers.join(", ") : "none (idle install)"}\n` +
         `  Migration: ${migration ? "recognized older router (rollback snapshot kept)" : "none needed"}\n` +
-        `  Native catalog: ${adoptNativeCatalog ? "adopt existing user catalog" : "capture from Codex"}\n` +
-        `  Changes: per-user background service and the managed Codex config block\n`,
+        (dshTarget
+          ? `  Changes: per-user background service and one provider route in the harness settings document\n`
+          : `  Native catalog: ${adoptNativeCatalog ? "adopt existing user catalog" : "capture from Codex"}\n` +
+            `  Changes: per-user background service and the managed Codex config block\n`),
     );
     if (!confirm("Proceed?")) {
       throw incomplete("Setup was cancelled before installing the service.");
@@ -453,8 +522,14 @@ async function main() {
     run(process.execPath, [path.join(SOURCE_ROOT, "src", "smoke-test.mjs"), "--yes"]);
   }
   run(process.execPath, [path.join(SOURCE_ROOT, "src", "doctor.mjs")]);
+  const providerSummary = providers.length
+    ? providers.join(", ")
+    : "no providers (idle install; traffic gets a local error until one is enabled)";
   process.stdout.write(
-    `\nCodex Router is ready with: ${providers.join(", ")}\nFully quit Codex, reopen it, and start a new task.\n`,
+    dshTarget
+      ? `\nDeepSeek Harness is ready with: ${providerSummary}\n` +
+        `It reloads its settings document on the next request, so there is nothing to restart.\n`
+      : `\nCodex Router is ready with: ${providerSummary}\nFully quit Codex, reopen it, and start a new task.\n`,
   );
   if (visionBridge?.enabled && visionBridge.engine) {
     process.stdout.write(

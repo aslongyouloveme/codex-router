@@ -2,7 +2,12 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { MODELS, PROVIDERS } from "./model-registry.mjs";
+import {
+  anonymousModelAllowed,
+  MODELS,
+  PROVIDERS,
+  resolveProviderBaseUrl,
+} from "./model-registry.mjs";
 import { credentialStatus, resolveProviderCredential } from "./provider-credentials.mjs";
 import {
   ensureFreshGitHubCopilotSession,
@@ -17,7 +22,9 @@ function option(name) {
 export function modelIds(payload, provider) {
   const data = Array.isArray(payload) ? payload : payload?.data;
   if (!Array.isArray(data)) throw new Error("The provider returned an invalid model list.");
-  const candidates = provider?.authProfile === "github-copilot"
+  const candidates = provider?.authMode === "anonymous"
+    ? data.filter((item) => anonymousModelAllowed(provider, item?.id))
+    : provider?.authProfile === "github-copilot"
     ? data.filter((item) =>
         typeof item?.id === "string" &&
         !item.id.startsWith("accounts/") &&
@@ -38,8 +45,13 @@ async function providerPayload(provider) {
   if (fixture) return JSON.parse(readFileSync(path.resolve(fixture), "utf8"));
   const credential = resolveProviderCredential(provider);
   if (!credential) throw new Error(credentialStatus(provider).setup);
-  let baseUrl = String(process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
-  let headers = provider.protocol === "anthropic"
+  // The same loopback guard the api-forwarder applies: a keyless provider's
+  // placeholder credential passes the check above, so an unguarded override
+  // would send `Bearer local` to whatever host the environment names.
+  let baseUrl = resolveProviderBaseUrl(provider).baseUrl;
+  let headers = provider.authMode === "anonymous"
+    ? {}
+    : provider.protocol === "anthropic"
     ? { "x-api-key": credential.value, "anthropic-version": "2023-06-01" }
     : { Authorization: `Bearer ${credential.value}` };
   if (provider.authProfile === "github-copilot") {

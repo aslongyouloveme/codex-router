@@ -22,10 +22,16 @@ background, then a tool-capable model is checked on and published to Codex.
 The tray shows a persistent status card immediately—checking fit, preparing
 Ollama, pulling layers, and then ready or failed—so a long download never looks
 like a dead click.
+While a pull or removal is active, that card includes **Cancel**. Cancellation
+stops the exact detached worker (including its child process on Windows), keeps
+the cancelled result visible, and leaves the model in its last completed state.
+Repeated clicks or concurrent commands reuse the existing operation; they do
+not start a second Ollama pull or removal.
 
-The **View more** panel includes the complete tag inventories captured from the
-official Ollama pages for Gemma 4, Qwen 3.5/3.6, Nemotron 3 Super, Ornith,
-Nemotron 3, and Muse Glimmer. That includes quantized, MLX, BF16, and other
+The native macOS tray's **View more** panel and the Windows/Linux panel's
+**Discover Ollama** section include the complete tag inventories captured from
+the official Ollama pages for Gemma 4, Qwen 3.5/3.6/3.8, Nemotron 3 Super,
+Ornith, Nemotron 3, and Muse Glimmer. That includes quantized, MLX, BF16, and other
 published variants—not only the family aliases. Cloud aliases are shown for
 completeness but are labelled **cloud only** and cannot be downloaded as local
 weights. The manifest is a dated snapshot, so arbitrary Ollama tags and model
@@ -49,6 +55,7 @@ Useful commands:
 ./bin/control local-models inspect https://ollama.com/library/gemma4:12b
 ./bin/control local-models install gemma4:12b --yes
 ./bin/control local-models install gpt-oss:20b --yes --force
+./bin/control local-models cancel gemma4:12b
 ./bin/control local-models benchmark gemma4:12b
 ./bin/control local-models runtime status
 ./bin/control local-models runtime start
@@ -70,6 +77,24 @@ no service to restart; restart them by hand after toggling.
 Updating Ollama is explicit. A normal model install reuses the installed
 runtime and does not replace it behind the user's back.
 
+## LM Studio
+
+LM Studio is supported as a separate local OpenAI-compatible backend. It can
+run alongside Ollama; models use the stable `lmstudio/<model-id>` namespace so
+identical model IDs from the two backends remain distinct.
+
+Start LM Studio's local server, enable the provider, and curate the models
+reported by its `/v1/models` endpoint:
+
+```text
+./bin/model-router codex providers enable lmstudio
+./bin/curate-models lmstudio
+```
+
+The default endpoint is `http://127.0.0.1:1234/v1`. Override it with
+`MODEL_ROUTER_LMSTUDIO_BASE_URL`. LM Studio models use the generic Chat
+Completions path; Ollama continues using its native route and context handling.
+
 Downloads rated too large for the machine are stopped unless `--force` is
 present; `--yes` alone does not override the fit check, because consenting to
 install Ollama is not the same as consenting to a model that will not run. A
@@ -80,3 +105,4 @@ Checking a model uses one canonical tag. `devstral` and `devstral:latest` are
 the same weights, so checking or unchecking through either spelling affects the
 same entry, and selection files written by older versions are normalized on the
 next write.
+

@@ -6,15 +6,14 @@ import {
   openSync,
   readFileSync,
   realpathSync,
-  renameSync,
   unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { protectPrivateFile } from "./file-security.mjs";
+import { writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
+import { processStartIdentity, stateOwnsProcess } from "./process-identity.mjs";
 
 export const DEFAULT_OLLAMA_HOST = "127.0.0.1:11434";
 export const DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434";
@@ -124,19 +123,6 @@ export async function probeOllama({
   }
 }
 
-function writePrivateJson(target, value) {
-  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const temporary = `${target}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  protectPrivateFile(temporary);
-  renameSync(temporary, target);
-  protectPrivateFile(target);
-  return value;
-}
-
 export function readOllamaRuntimeState() {
   try {
     const parsed = JSON.parse(readFileSync(OLLAMA_RUNTIME_STATE_PATH, "utf8"));
@@ -158,44 +144,15 @@ function clearOllamaRuntimeState() {
 // may reuse it for an unrelated Ollama server (or an entirely different
 // process). Persist the process start identity beside the PID and require both
 // to match before the router ever calls kill().
-export function ollamaProcessIdentity(
-  pid,
-  { spawn = spawnSync, platform = process.platform } = {},
-) {
-  if (!Number.isSafeInteger(pid) || pid < 1) return undefined;
-  try {
-    if (platform === "win32") {
-      const script =
-        `$p = Get-Process -Id ${pid} -ErrorAction Stop; ` +
-        `[Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks.ToString() + '|' + $p.Path)`;
-      const result = spawn(
-        "powershell.exe",
-        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-        { encoding: "utf8", windowsHide: true },
-      );
-      return result.status === 0 ? String(result.stdout || "").trim() || undefined : undefined;
-    }
-    const result = spawn("ps", ["-p", String(pid), "-o", "lstart=", "-o", "comm="], {
-      encoding: "utf8",
-    });
-    return result.status === 0 ? String(result.stdout || "").trim() || undefined : undefined;
-  } catch {
-    return undefined;
-  }
-}
+// Kept under its original name: the implementation is shared with the harness
+// web server now, and nothing about it was ever Ollama-specific.
+export const ollamaProcessIdentity = processStartIdentity;
 
 export function ollamaRuntimeStateOwnsProcess(
   state = readOllamaRuntimeState(),
   { identity = ollamaProcessIdentity } = {},
 ) {
-  return Boolean(
-    state?.managed &&
-      Number.isSafeInteger(state.pid) &&
-      state.pid > 0 &&
-      typeof state.processIdentity === "string" &&
-      state.processIdentity.length > 0 &&
-      identity(state.pid) === state.processIdentity,
-  );
+  return stateOwnsProcess(state, { identity });
 }
 
 function wait(milliseconds) {

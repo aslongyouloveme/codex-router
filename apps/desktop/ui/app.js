@@ -12,9 +12,18 @@ import {
   visibleLocalDownload,
 } from "./model.mjs";
 import { createThinkingOrb } from "./thinking-orb.mjs";
+import {
+  applyTranslations,
+  availableLanguages,
+  getLanguage,
+  setLanguage,
+  t,
+} from "./i18n.mjs";
 
 const invoke = window.__TAURI__?.core?.invoke;
 const view = new URLSearchParams(window.location.search).get("view") || "panel";
+
+applyTranslations(document);
 
 if (view === "island") {
   document.getElementById("island").hidden = false;
@@ -31,19 +40,35 @@ function startPanel() {
     providerUsage: null,
     providerSetup: null,
     localModels: null,
+    visionBridge: null,
+    visionDownload: null,
+    visionPollTimer: null,
+    presence: null,
     modelSettings: null,
     health: null,
     platform: null,
     settings: null,
     selectedSource: null,
+    usageRange: 7,
     sourceWasChosen: false,
     busyProvider: null,
     modelSettingsBusy: false,
     localModelBusy: null,
+    localCancelBusy: false,
     localRemoveArmed: null,
+    localCatalogFilter: "",
+    localQuickPicksExpanded: false,
+    localVariantHelpExpanded: false,
     localPollTimer: null,
     lastActivityState: null,
     loginFreeBusy: false,
+    signedRoutingBusy: false,
+    presenceBusy: false,
+    visionBusy: false,
+    maintenanceBusy: null,
+    localBenchmarkBusy: null,
+    maintenanceResult: null,
+    toolResultAgingBusy: false,
     keyProvider: null,
     removeProvider: null,
     toastTimer: null,
@@ -52,12 +77,15 @@ function startPanel() {
   const elements = {
     tabs: [...document.querySelectorAll(".tab")],
     usageView: document.getElementById("usage-view"),
+    statusView: document.getElementById("status-view"),
     connectionsView: document.getElementById("connections-view"),
     modelsView: document.getElementById("models-view"),
     close: document.getElementById("close-panel"),
     routerStatus: document.getElementById("router-status"),
     liveState: document.getElementById("live-state"),
     source: document.getElementById("usage-source"),
+    usageRange: document.getElementById("usage-range"),
+    usageRangeLabel: document.getElementById("usage-range-label"),
     today: document.getElementById("today-tokens"),
     week: document.getElementById("week-tokens"),
     speedModel: document.getElementById("speed-model"),
@@ -70,6 +98,10 @@ function startPanel() {
     chartDays: document.getElementById("chart-days"),
     chartTooltip: document.getElementById("chart-tooltip"),
     quotaCards: document.getElementById("quota-cards"),
+    usageOverview: document.getElementById("usage-overview"),
+    statusSummary: document.getElementById("status-summary"),
+    activeRequests: document.getElementById("active-requests"),
+    quotaResets: document.getElementById("quota-resets"),
     providers: document.getElementById("provider-list"),
     subagentSummary: document.getElementById("subagent-summary"),
     pickerSummary: document.getElementById("picker-summary"),
@@ -84,9 +116,30 @@ function startPanel() {
     localModelForm: document.getElementById("local-model-form"),
     localModelInput: document.getElementById("local-model-input"),
     localQuickPicks: document.getElementById("local-quick-picks"),
+    localCatalog: document.getElementById("local-catalog"),
     loginFreeSwitch: document.getElementById("login-free-switch"),
     loginFreeSwitchLabel: document.getElementById("login-free-switch-label"),
     loginFreeNote: document.getElementById("login-free-note"),
+    signedRoutingSwitch: document.getElementById("signed-routing-switch"),
+    signedRoutingSwitchLabel: document.getElementById("signed-routing-switch-label"),
+    signedRoutingNote: document.getElementById("signed-routing-note"),
+    presenceMode: document.getElementById("presence-mode"),
+    presenceNote: document.getElementById("presence-note"),
+    maintenanceStatus: document.getElementById("maintenance-status"),
+    maintenanceNote: document.getElementById("maintenance-note"),
+    maintenanceUpdate: document.getElementById("maintenance-update"),
+    maintenanceFix: document.getElementById("maintenance-fix"),
+    toolResultAgingSwitch: document.getElementById("tool-result-aging-switch"),
+    toolResultAgingSwitchLabel: document.getElementById("tool-result-aging-switch-label"),
+    toolResultAgingNote: document.getElementById("tool-result-aging-note"),
+    visionSummary: document.getElementById("vision-summary"),
+    visionNote: document.getElementById("vision-note"),
+    visionSwitch: document.getElementById("vision-switch"),
+    visionSwitchLabel: document.getElementById("vision-switch-label"),
+    visionEngine: document.getElementById("vision-engine"),
+    visionEffort: document.getElementById("vision-effort"),
+    visionLocalModels: document.getElementById("vision-local-models"),
+    localRuntimeActions: document.getElementById("local-runtime-actions"),
     refresh: document.getElementById("refresh-data"),
     islandSwitch: document.getElementById("island-switch"),
     islandSwitchLabel: document.getElementById("island-switch-label"),
@@ -104,7 +157,20 @@ function startPanel() {
     removeForm: document.getElementById("remove-form"),
     closeRemoveDialog: document.getElementById("close-remove-dialog"),
     cancelRemove: document.getElementById("cancel-remove"),
+    language: document.getElementById("language-select"),
   };
+
+  if (elements.language) {
+    elements.language.innerHTML = availableLanguages()
+      .map((language) => `<option value="${language.id}">${language.label}</option>`)
+      .join("");
+    elements.language.value = getLanguage();
+    elements.language.addEventListener("change", () => {
+      setLanguage(elements.language.value);
+      applyTranslations(document);
+      renderPanel();
+    });
+  }
 
   elements.tabs.forEach((button) => {
     button.addEventListener("click", () => selectTab(button.dataset.tab));
@@ -114,6 +180,11 @@ function startPanel() {
   elements.source.addEventListener("change", () => {
     state.selectedSource = elements.source.value;
     state.sourceWasChosen = true;
+    renderUsage();
+  });
+  elements.usageRange.addEventListener("change", () => {
+    const selected = Number(elements.usageRange.value);
+    state.usageRange = [7, 30, 90].includes(selected) ? selected : 7;
     renderUsage();
   });
   elements.providers.addEventListener("click", handleProviderClick);
@@ -128,9 +199,22 @@ function startPanel() {
   elements.pickerModelList.addEventListener("click", handleModelSettingsClick);
   elements.localModelList.addEventListener("click", handleLocalModelClick);
   elements.localModelList.addEventListener("change", handleLocalModelToggle);
+  elements.localRuntimeActions.addEventListener("click", handleLocalRuntimeClick);
+  elements.localDownloadStatus.addEventListener("click", handleLocalModelClick);
   elements.localQuickPicks.addEventListener("click", handleLocalModelClick);
+  elements.localCatalog.addEventListener("click", handleLocalModelClick);
+  elements.localCatalog.addEventListener("input", handleLocalCatalogInput);
+  elements.visionLocalModels.addEventListener("click", handleVisionClick);
   elements.localModelForm.addEventListener("submit", handleLocalModelInstall);
   elements.loginFreeSwitch.addEventListener("change", handleLoginFreeToggle);
+  elements.signedRoutingSwitch.addEventListener("change", handleSignedRoutingToggle);
+  elements.presenceMode.addEventListener("change", handlePresenceModeChange);
+  elements.toolResultAgingSwitch.addEventListener("change", handleToolResultAgingToggle);
+  elements.visionSwitch.addEventListener("change", handleVisionToggle);
+  elements.visionEngine.addEventListener("change", handleVisionEngineChange);
+  elements.visionEffort.addEventListener("change", handleVisionEffortChange);
+  elements.maintenanceUpdate.addEventListener("click", () => runMaintenance("update"));
+  elements.maintenanceFix.addEventListener("click", () => runMaintenance("fix"));
   elements.islandSwitch.addEventListener("change", handleIslandToggle);
   elements.keyForm.addEventListener("submit", saveKey);
   elements.closeDialog.addEventListener("click", closeKeyDialog);
@@ -152,8 +236,8 @@ function startPanel() {
   });
 
   if (!invoke) {
-    elements.routerStatus.textContent = "Desktop bridge unavailable";
-    showToast("Open this surface from the Model Router desktop app.", true);
+    elements.routerStatus.textContent = t("status.desktopBridgeUnavailable");
+    showToast(t("general.desktopBridgeHint"), true);
     return;
   }
 
@@ -163,9 +247,11 @@ function startPanel() {
 
   function selectTab(tab) {
     const usage = tab === "usage";
+    const status = tab === "status";
     const models = tab === "models";
     elements.usageView.hidden = !usage;
-    elements.connectionsView.hidden = usage || models;
+    elements.statusView.hidden = !status;
+    elements.connectionsView.hidden = usage || status || models;
     elements.modelsView.hidden = !models;
     elements.tabs.forEach((button) => button.classList.toggle("is-active", button.dataset.tab === tab));
   }
@@ -177,7 +263,6 @@ function startPanel() {
       ["account", "account_usage"],
       ["providerUsage", "provider_usage"],
       ["providerSetup", "provider_setup"],
-      ["localModels", "local_models"],
       ["health", "router_health"],
       ["platform", "platform_info"],
       ["settings", "desktop_settings"],
@@ -196,6 +281,16 @@ function startPanel() {
       if ("value" in result) state[result.key] = result.value;
       else errors.push(result.error);
     }
+    // The control snapshot already contains the local-model, vision-bridge,
+    // and presence views. Reusing them avoids starting separate Node processes
+    // for the same Ollama inventory and keeps all three sections consistent.
+    const codexSettings = state.snapshot?.targets?.codex?.modelSettings;
+    if (codexSettings?.localModels) state.localModels = codexSettings.localModels;
+    if (codexSettings?.visionBridge) {
+      state.visionBridge = codexSettings.visionBridge;
+      state.visionDownload = codexSettings.visionBridge.download || null;
+    }
+    if (state.snapshot?.presence) state.presence = state.snapshot.presence;
     renderPanel();
     elements.refresh.disabled = false;
     if (!quiet && errors.length && !state.snapshot) showToast(errorMessage(errors[0]), true);
@@ -226,30 +321,31 @@ function startPanel() {
     renderSourcePicker();
     renderUsage();
     renderQuotas();
+    renderUsageOverview();
+    renderStatusView();
     renderProviders();
     renderLoginFreeSetting();
+    renderSignedRouting();
+    renderPresence();
+    renderMaintenance();
     renderIslandSetting();
     renderModelSettings();
+    renderToolResultAgingSetting();
+    renderVisionBridge();
     renderLocalModels();
   }
 
   function renderStatus() {
     const activity = state.health?.activity || {};
     const activityState = state.health?.ok === false ? "offline" : activity.state || "idle";
-    const labels = {
-      generating: "Thinking",
-      starting: "Starting",
-      offline: "Offline",
-      error: "Error",
-      idle: "Idle",
-    };
+    const labels = activityLabels();
     elements.liveState.dataset.state = activityState;
-    elements.liveState.querySelector("span").textContent = labels[activityState] || "Idle";
+    elements.liveState.querySelector("span").textContent = labels[activityState] || t("status.idle");
     if (state.health?.ok) {
       const model = activity.model ? ` · ${activity.model}` : "";
-      elements.routerStatus.textContent = `Router online${model}`;
+      elements.routerStatus.textContent = t("status.routerOnline", { model });
     } else {
-      elements.routerStatus.textContent = "Router offline · usage remains available";
+      elements.routerStatus.textContent = t("status.routerOffline");
     }
     renderModelSpeed(activity);
   }
@@ -258,14 +354,17 @@ function startPanel() {
     const active = activity.active?.at(-1);
     const model = active?.model || activity.model;
     const provider = active?.provider || activity.provider;
-    const label = model ? String(model).split("/").at(-1) : "No model observed";
+    const label = model ? String(model).split("/").at(-1) : t("status.noModelObserved");
     const observed = observedModelSpeed(state.providerUsage, provider, model);
     elements.speedModel.textContent = label;
-    elements.modelSpeed.textContent = observed ? `${observed.speed.toFixed(1)} tok/s` : "— tok/s";
+    elements.modelSpeed.textContent = observed ? `${observed.speed.toFixed(1)} tok/s` : t("status.noSpeed");
     elements.modelSpeed.classList.toggle("is-measured", Boolean(observed));
     elements.speedDetail.textContent = observed
-      ? `Observed output throughput · ${observed.samples} ${observed.samples === 1 ? "reply" : "replies"}`
-      : "Appears after a metered reply";
+      ? t("status.observedThroughput", {
+          count: observed.samples,
+          reply: observed.samples === 1 ? t("status.reply") : t("status.replies"),
+        })
+      : t("status.appearsAfterMeteredReply");
   }
 
   function renderSourcePicker() {
@@ -287,15 +386,65 @@ function startPanel() {
               `<option value="${escapeHtml(option.id)}"${option.id === state.selectedSource ? " selected" : ""}>${escapeHtml(option.name)}</option>`,
           )
           .join("")
-      : '<option value="">No connected usage</option>';
+      : `<option value="">${escapeHtml(t("usage.noConnectedUsage"))}</option>`;
   }
 
   function renderUsage() {
     const source = sourceOptions(state).find((option) => option.id === state.selectedSource);
-    const series = dailySeries(source?.buckets || []);
+    const series = dailySeries(source?.buckets || [], state.usageRange);
     elements.today.textContent = source ? compactTokens(todayTokens(source)) : "—";
-    elements.week.textContent = source ? compactTokens(sevenDayTokens(source)) : "—";
+    elements.week.textContent = source
+      ? compactTokens(series.reduce((total, point) => total + point.tokens, 0))
+      : "\u2014";
+    elements.usageRange.value = String(state.usageRange);
+    elements.usageRangeLabel.textContent = `${state.usageRange} days`;
     renderChart(series, elements);
+  }
+
+  function renderUsageOverview() {
+    const providers = (state.providerUsage?.providers || [])
+      .filter((provider) => Number(provider.totalTokens) > 0 || Number(provider.requests) > 0)
+      .sort((left, right) => Number(right.totalTokens || 0) - Number(left.totalTokens || 0));
+    const models = providers
+      .flatMap((provider) => (provider.models || []).map((model) => ({ ...model, provider: provider.displayName || provider.id })))
+      .filter((model) => Number(model.totalTokens) > 0 || Number(model.requests) > 0)
+      .sort((left, right) => Number(right.totalTokens || 0) - Number(left.totalTokens || 0))
+      .slice(0, 8);
+    if (!providers.length && !models.length) {
+      elements.usageOverview.innerHTML = "";
+      return;
+    }
+    const providerRows = providers.slice(0, 6).map((provider) => `<div class="usage-row">
+      <span><strong>${escapeHtml(provider.displayName || provider.id)}</strong><small>${Number(provider.requests || 0).toLocaleString()} requests</small></span>
+      <strong>${compactTokens(provider.totalTokens)} tok</strong>
+    </div>`).join("");
+    const modelRows = models.map((model) => `<div class="usage-row">
+      <span><strong>${escapeHtml(model.displayName || model.slug)}</strong><small>${escapeHtml(model.provider)} · ${Number(model.requests || 0).toLocaleString()} requests</small></span>
+      <strong>${compactTokens(model.totalTokens)} tok</strong>
+    </div>`).join("");
+    elements.usageOverview.innerHTML = `${providerRows ? `<article class="usage-card"><header><strong>All usage</strong><small>router observed</small></header>${providerRows}</article>` : ""}${modelRows ? `<article class="usage-card"><header><strong>Tokens by model</strong><small>heaviest first</small></header>${modelRows}</article>` : ""}`;
+  }
+
+  function renderStatusView() {
+    const activity = state.health?.activity || {};
+    const active = Array.isArray(activity.active) ? activity.active : [];
+    const activeCount = Number(activity.activeCount ?? active.length) || 0;
+    elements.statusSummary.textContent = activeCount
+      ? `${activeCount} request${activeCount === 1 ? "" : "s"} in flight · ${activity.state || "active"}`
+      : `Router ${state.health?.ok === false ? "offline" : "ready"} · nothing in flight`;
+    elements.activeRequests.innerHTML = `<header><strong>Live requests</strong><small>${activeCount ? activeCount : "none"}</small></header>${active.length
+      ? active.map((request) => {
+          const started = Number(request.startedAt) || Date.now();
+          const elapsed = Math.max(0, (Date.now() - (started > 1e12 ? started : started * 1000)) / 1000);
+          const elapsedLabel = elapsed >= 60 ? `${Math.floor(elapsed / 60)}m ${String(Math.floor(elapsed % 60)).padStart(2, "0")}s` : `${elapsed.toFixed(1)}s`;
+          const label = request.model ? String(request.model).split("/").at(-1) : request.provider || "request";
+          return `<div class="status-row"><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(request.provider || "router")}${request.isSubagent ? " · subagent" : ""}</small></span><strong>${elapsedLabel}</strong></div>`;
+        }).join("")
+      : '<p class="status-empty">Nothing in flight.</p>'}`;
+    const resets = buildQuotaCards(state).filter((card) => card.resetAt);
+    elements.quotaResets.innerHTML = `<header><strong>Quota resets</strong><small>${resets.length || "none"}</small></header>${resets.length
+      ? resets.map((card) => `<div class="status-row"><span><strong>${escapeHtml(card.providerName)}</strong><small>${escapeHtml(card.label)}</small></span><strong>${escapeHtml(formatReset(card.resetAt))}</strong></div>`).join("")
+      : '<p class="status-empty">No reset times are available.</p>'}`;
   }
 
   function renderQuotas() {
@@ -303,17 +452,17 @@ function startPanel() {
     elements.quotaCards.innerHTML = cards.length
       ? cards
           .map((card) => {
-            const percent = card.usedPercent === null ? "—" : `${Math.round(card.usedPercent)}%`;
-            const progress = card.usedPercent === null ? 0 : card.usedPercent;
+            const percent = card.remainingPercent === null ? "—" : `${Math.round(card.remainingPercent)}%`;
+            const progress = card.remainingPercent === null ? 0 : card.remainingPercent;
             return `<article class="quota-card">
               <header><span class="quota-provider">${escapeHtml(card.providerName)}</span><span class="quota-value">${percent}</span></header>
               <h3>${card.label}</h3>
-              <progress max="100" value="${progress}" aria-label="${escapeHtml(card.label)} ${percent} used"></progress>
+              <progress max="100" value="${progress}" aria-label="${escapeHtml(t("usage.used", { label: card.label, percent }))}"></progress>
               <p>${escapeHtml(formatReset(card.resetAt))}</p>
             </article>`;
           })
           .join("")
-      : '<div class="empty-state">Connect OAuth or add an API key to show provider limits here.</div>';
+      : `<div class="empty-state">${escapeHtml(t("connections.connectToShowLimits"))}</div>`;
   }
 
   function renderProviders() {
@@ -321,7 +470,7 @@ function startPanel() {
     const enabled = new Set(state.snapshot?.targets?.codex?.enabledProviders || []);
     elements.providers.innerHTML = providers.length
       ? providers.map((provider) => providerRow(provider, enabled.has(provider.id))).join("")
-      : '<div class="empty-state">Provider setup is unavailable while the router files cannot be found.</div>';
+      : `<div class="empty-state">${escapeHtml(t("connections.providerSetupUnavailable"))}</div>`;
   }
 
   function renderLoginFreeSetting() {
@@ -329,43 +478,150 @@ function startPanel() {
     elements.loginFreeSwitch.checked = enabled;
     elements.loginFreeSwitch.disabled = state.loginFreeBusy || state.busyProvider !== null;
     elements.loginFreeSwitchLabel.title = enabled
-      ? "External-provider mode is active for new Codex sessions."
-      : "Use the local router without signing in to OpenAI.";
+      ? t("connections.externalModeActive")
+      : t("connections.localRouterWithoutLogin");
     elements.loginFreeNote.textContent = enabled
-      ? "External providers · restart Codex to apply"
-      : "Use connected external models in new Codex sessions";
+      ? t("connections.externalProvidersRestart")
+      : t("connections.useConnectedModels");
+  }
+
+  function renderSignedRouting() {
+    const target = state.snapshot?.targets?.codex || {};
+    const enabled = target.signedRouting === true;
+    const managed = target.signedRoutingManaged === true;
+    elements.signedRoutingSwitch.checked = enabled;
+    elements.signedRoutingSwitch.disabled = state.signedRoutingBusy || managed || state.loginFreeBusy;
+    elements.signedRoutingSwitchLabel.title = managed
+      ? "Managed by the environment"
+      : enabled
+        ? "External requests use the router while native ChatGPT task history stays available."
+        : "Keep the native ChatGPT transport in place.";
+    elements.signedRoutingNote.textContent = managed
+      ? "Managed by the environment"
+      : enabled
+        ? "Native GPT plus external models · task history preserved"
+        : "Keep native ChatGPT transport and task history";
+  }
+
+  function renderPresence() {
+    const mode = state.presence?.mode || "always";
+    elements.presenceMode.value = mode;
+    elements.presenceMode.disabled = state.presenceBusy;
+    elements.presenceNote.textContent = mode === "follow-codex"
+      ? "Show while Codex or ChatGPT is running"
+      : "Keep the Windows tray visible";
+  }
+
+  function renderMaintenance() {
+    const busy = Boolean(state.maintenanceBusy);
+    elements.maintenanceUpdate.disabled = busy;
+    elements.maintenanceFix.disabled = busy;
+    if (busy) {
+      elements.maintenanceStatus.textContent = state.maintenanceBusy === "fix" ? "Repairing…" : "Updating…";
+      elements.maintenanceNote.textContent = "The router is running maintenance; this may take a moment.";
+      return;
+    }
+    const result = state.maintenanceResult;
+    elements.maintenanceStatus.textContent = result?.ok ? "Verified" : result?.error ? "Maintenance failed" : "Router ready";
+    elements.maintenanceNote.textContent = result?.message || "Update the checkout and verify its installation.";
+  }
+
+  function renderVisionBridge() {
+    const vision = state.visionBridge || {};
+    state.visionBridge = vision;
+    const enabled = vision.enabled === true;
+    const selected = vision.engine || "auto";
+    const selectedName = vision.resolvedEngineName || vision.resolvedEngine || "no engine";
+    elements.visionSummary.textContent = enabled ? `on · ${selectedName}` : "off";
+    elements.visionNote.textContent = enabled
+      ? `Reading via ${selectedName}${vision.effort ? ` · ${vision.effort}` : ""}`
+      : "Off · text-only models refuse pasted images";
+    elements.visionSwitch.checked = enabled;
+    elements.visionSwitch.disabled = state.visionBusy;
+    elements.visionSwitchLabel.title = enabled ? "Disable image transcription" : "Enable image transcription";
+
+    const engineNames = new Map();
+    for (const entry of [...(vision.paidEngines || []), ...(vision.nativeEngines || [])]) {
+      if (entry?.slug) engineNames.set(entry.slug, entry.displayName || entry.slug);
+    }
+    const engineOptions = [
+      `<option value="auto"${selected === "auto" || !vision.engine ? " selected" : ""}>Auto · ${escapeHtml(selectedName)}</option>`,
+      ...[...(vision.availableEngines || [])]
+        .filter((slug) => slug !== "local")
+        .map((slug) => `<option value="${escapeHtml(slug)}"${slug === selected ? " selected" : ""}>${escapeHtml(engineNames.get(slug) || slug)}</option>`),
+      ...(vision.localModels || []).some((model) => model.installed)
+        ? [`<option value="local"${selected === "local" ? " selected" : ""}>Local · ${escapeHtml(vision.local?.model || "Ollama")}</option>`]
+        : [],
+    ];
+    elements.visionEngine.innerHTML = engineOptions.join("");
+    elements.visionEngine.disabled = state.visionBusy || !enabled;
+    const efforts = vision.availableEfforts || [];
+    elements.visionEffort.innerHTML = efforts.length
+      ? [`<option value="default"${!vision.effort ? " selected" : ""}>Model default</option>`, ...efforts.map((effort) => `<option value="${escapeHtml(effort)}"${effort === vision.effort ? " selected" : ""}>${escapeHtml(effort)}</option>`)].join("")
+      : '<option value="default">Model default</option>';
+    elements.visionEffort.disabled = state.visionBusy || !enabled || !efforts.length;
+
+    const models = vision.localModels || [];
+    const operation = state.visionDownload;
+    elements.visionLocalModels.innerHTML = models.length
+      ? `<div class="local-section-label"><span>Local image readers</span><small>${models.length} available</small></div>${models.map((model) => {
+          const installed = model.installed === true;
+          const active = operation?.tag === model.tag && operation?.status === "downloading";
+          const action = active ? `<button class="mini-button" type="button" disabled>${Number(operation.percent || 0)}%</button>` : installed ? `<button class="mini-button" type="button" data-vision-action="use" data-model="${escapeHtml(model.tag)}">${vision.engine === "local" && vision.local?.model === model.tag ? "Using" : "Use"}</button>` : `<button class="mini-button" type="button" data-vision-action="download" data-model="${escapeHtml(model.tag)}"${state.visionBusy ? " disabled" : ""}>Download</button>`;
+          const tests = installed ? `<button class="text-button" type="button" data-vision-action="benchmark" data-model="${escapeHtml(model.tag)}"${state.localBenchmarkBusy ? " disabled" : ""}>Test</button>` : "";
+          return `<div class="vision-model-row"><span><strong>${escapeHtml(model.label || model.tag)}</strong><small>${escapeHtml(model.tag)} · ${escapeHtml(model.accuracy || "unmeasured")}</small></span><span>${tests}${action}</span></div>`;
+        }).join("")}`
+      : "";
   }
 
   function providerRow(provider, enabled) {
     const isBusy = state.busyProvider === provider.id;
-    const credentialLabel = provider.credentialLabel || "API key";
-    const kind = provider.kind === "oauth" ? "OAuth" : credentialLabel;
-    let detail = provider.configured ? `${kind} connected` : `${kind} not connected`;
+    const isAnonymous = provider.kind === "anonymous";
+    const isApiKey = !provider.credentialLabel || provider.credentialLabel === "API key" || provider.credentialLabel === t("connections.apiKey");
+    const credentialLabel = isAnonymous
+      ? t("connections.noApiKey")
+      : isApiKey
+      ? t("connections.apiKey")
+      : provider.credentialLabel === "GitHub token" ? t("connections.githubToken") : provider.credentialLabel;
+    const kind = provider.kind === "oauth" ? t("connections.oauth") : credentialLabel;
+    let detail = provider.configured
+      ? t("connections.connected", { kind })
+      : t("connections.notConnected", { kind });
     let action = "";
     let actionLabel = "";
     if (provider.kind === "oauth") {
-      action = provider.cliInstalled ? "login" : "install";
-      actionLabel = provider.cliInstalled ? (provider.configured ? "Reconnect" : "Sign in") : "Install CLI";
+      action = "connect";
+      actionLabel = provider.cliInstalled
+        ? provider.configured ? t("connections.reconnect") : t("connections.signIn")
+        : `${t("connections.installCli")} & ${t("connections.signIn")}`;
+    } else if (isAnonymous) {
+      action = "none";
+      actionLabel = t("connections.ready");
     } else {
       action = "key";
-      actionLabel = credentialLabel === "API key"
-        ? provider.configured ? "Replace key" : "Add key"
-        : provider.configured ? `Replace ${credentialLabel}` : `Add ${credentialLabel}`;
+      actionLabel = isApiKey
+        ? provider.configured ? t("connections.replaceKey") : t("connections.addKey")
+        : provider.configured
+          ? t("connections.replaceCredential", { credential: credentialLabel })
+          : t("connections.addCredential", { credential: credentialLabel });
     }
-    if (isBusy) detail = "Working…";
+    if (isBusy) detail = t("status.working");
     const canRemove = provider.kind === "api" && provider.configured;
+    const actionButton = isAnonymous
+      ? `<button class="mini-button" type="button" disabled title="${escapeHtml(provider.anonymousNote || t("connections.noApiKey"))}">${escapeHtml(actionLabel)}</button>`
+      : `<button class="mini-button" type="button" data-action="${action}" data-provider="${escapeHtml(provider.id)}"${isBusy ? " disabled" : ""}>${escapeHtml(actionLabel)}</button>`;
     return `<article class="provider-row">
-      <div><strong>${escapeHtml(provider.displayName)}</strong><small>${escapeHtml(detail)}</small>${provider.planNote ? `<small>${escapeHtml(provider.planNote)}</small>` : ""}</div>
+      <div><strong>${escapeHtml(provider.displayName)}</strong><small>${escapeHtml(detail)}</small>${provider.planNote ? `<small>${escapeHtml(localizeProviderPlan(provider.planNote))}</small>` : ""}${provider.anonymousNote ? `<small>${escapeHtml(provider.anonymousNote)}</small>` : ""}</div>
       <div class="provider-actions">
-        <button class="mini-button" type="button" data-action="${action}" data-provider="${escapeHtml(provider.id)}"${isBusy ? " disabled" : ""}>${escapeHtml(actionLabel)}</button>
+        ${actionButton}
         ${
           canRemove
-            ? `<button class="mini-button danger" type="button" data-action="remove-key" data-provider="${escapeHtml(provider.id)}" aria-label="Remove ${escapeHtml(provider.displayName)} credential"${isBusy ? " disabled" : ""}>Remove</button>`
+            ? `<button class="mini-button danger" type="button" data-action="remove-key" data-provider="${escapeHtml(provider.id)}" aria-label="${escapeHtml(t("connections.removeCredentialAria", { provider: provider.displayName }))}"${isBusy ? " disabled" : ""}>${escapeHtml(t("actions.remove"))}</button>`
             : ""
         }
         ${
           provider.configured
-            ? `<label class="provider-check"><input type="checkbox" data-provider="${escapeHtml(provider.id)}" aria-label="Enable ${escapeHtml(provider.displayName)}"${enabled ? " checked" : ""}${isBusy ? " disabled" : ""}></label>`
+            ? `<label class="provider-check"><input type="checkbox" data-provider="${escapeHtml(provider.id)}" aria-label="${escapeHtml(t("connections.enableProviderAria", { provider: provider.displayName }))}"${enabled ? " checked" : ""}${isBusy ? " disabled" : ""}></label>`
             : ""
         }
       </div>
@@ -376,10 +632,10 @@ function startPanel() {
     const supported = state.platform?.islandSupported !== false;
     elements.islandSwitch.disabled = !supported;
     elements.islandSwitch.checked = supported && state.settings?.islandEnabled !== false;
-    elements.islandSwitchLabel.title = supported ? "" : state.platform?.islandReason || "Unavailable";
+    elements.islandSwitchLabel.title = supported ? "" : state.platform?.islandReason || t("footer.unavailable");
     elements.islandNote.textContent = supported
-      ? "Top-center live activity · hover for daily graph"
-      : state.platform?.islandReason || "Unavailable on this desktop session";
+      ? t("footer.topCenterGraph")
+      : state.platform?.islandReason || t("general.unavailableThisSession");
   }
 
   function toggleAccordion(button) {
@@ -402,7 +658,6 @@ function startPanel() {
     );
     const pickerModels = models.filter((model) => model.enabled);
     const subagent = settings?.subagents || { mode: "proven", enabled: [], disabled: [] };
-    const enabledSubagents = new Set(subagent.enabled || []);
     const disabledSubagents = new Set(subagent.disabled || []);
     const hiddenModels = new Set(settings?.picker?.hidden || []);
     const providerNames = new Map(
@@ -436,7 +691,9 @@ function startPanel() {
     // for a picker toggle.
     function providerGroupsMarkup(groups, rowMarkup, setting, groupSummary) {
       const [onLabel, offLabel] =
-        setting === "picker" ? ["Show all", "Hide all"] : ["Subagents on", "Subagents off"];
+        setting === "picker"
+          ? [t("actions.showAll"), t("actions.hideAll")]
+          : [t("actions.subagentsOn"), t("actions.subagentsOff")];
       return groups
         .map(
           (group) => `<details class="model-provider-group" open>
@@ -453,75 +710,66 @@ function startPanel() {
 
     elements.subagentAllSwitch.disabled = state.modelSettingsBusy;
     elements.subagentAllSwitch.checked = subagent.mode === "all";
-    elements.subagentAllSwitchLabel.title = subagent.mode === "all"
-      ? "Every enabled model is exposed as a Codex subagent."
-      : subagent.mode === "selected"
-        ? "Only selected models are exposed as Codex subagents."
-        : "Only registry-proven v2 models are exposed as Codex subagents.";
+    elements.subagentAllSwitchLabel.title = t("models.onlyProvenV2");
 
     // Models hidden from the picker are forced off as subagents, so their
     // rows here were permanently locked noise. They are filtered out; the
     // note under the list keeps the count visible and points at the picker
     // section, which is where unhiding brings a model back.
     const subagentModels = enabledModels.filter(
-      (model) => !model.native && model.visible !== false,
+      (model) =>
+        !model.native && model.visible !== false && model.multiAgentVersion === "v2",
     );
     const hiddenSubagentCount = enabledModels.filter(
-      (model) => !model.native && model.visible === false,
+      (model) =>
+        !model.native && model.visible === false && model.multiAgentVersion === "v2",
     ).length;
     const subagentGroups = groupModels(subagentModels);
     const isSubagentOn = (model) =>
       model.visible === false
         ? false
-        : subagent.mode === "all"
-        ? !disabledSubagents.has(model.slug)
-        : (model.multiAgentVersion === "v2" || enabledSubagents.has(model.slug)) &&
-          !disabledSubagents.has(model.slug);
+        : !disabledSubagents.has(model.slug);
     const subagentRow = (model) => {
         const checked = isSubagentOn(model);
-        const badge = model.multiAgentVersion === "v2" ? " · proven v2" : "";
+        const badge = t("models.provenV2");
         return `<label class="model-setting-row">
           <span><strong>${escapeHtml(model.displayName)}</strong><small>${escapeHtml(badge)}</small></span>
-          <span class="provider-check"><input type="checkbox" data-subagent="${escapeHtml(model.slug)}" aria-label="Use ${escapeHtml(model.displayName)} as a subagent"${checked ? " checked" : ""}${state.modelSettingsBusy ? " disabled" : ""}></span>
+          <span class="provider-check"><input type="checkbox" data-subagent="${escapeHtml(model.slug)}" aria-label="${escapeHtml(t("models.useModelAria", { model: model.displayName }))}"${checked ? " checked" : ""}${state.modelSettingsBusy ? " disabled" : ""}></span>
         </label>`;
       };
 
     const hiddenSubagentNote = hiddenSubagentCount
-      ? `<div class="model-settings-note">${hiddenSubagentCount} model${
-          hiddenSubagentCount === 1 ? " is" : "s are"
-        } hidden from the picker and not listed here. Show ${
-          hiddenSubagentCount === 1 ? "it" : "them"
-        } in the picker section below to use ${
-          hiddenSubagentCount === 1 ? "it" : "them"
-        } as ${hiddenSubagentCount === 1 ? "a subagent" : "subagents"}.</div>`
+      ? `<div class="model-settings-note">${escapeHtml(t(
+          hiddenSubagentCount === 1 ? "models.hiddenFromPickerOne" : "models.hiddenFromPickerMany",
+          { count: hiddenSubagentCount },
+        ))}</div>`
       : "";
     elements.subagentModelList.innerHTML = subagentGroups.length
       ? providerGroupsMarkup(
           subagentGroups,
           subagentRow,
           "subagents",
-          (group) => `${group.items.filter(isSubagentOn).length} of ${group.items.length} on`,
+          (group) => t("models.providerCountOn", {
+            on: group.items.filter(isSubagentOn).length,
+            total: group.items.length,
+          }),
         ) + hiddenSubagentNote
-      : `<div class="empty-state">Enable a provider to choose subagent models here.</div>${hiddenSubagentNote}`;
-    const subagentCount = subagent.mode === "all"
-      ? enabledModels.filter(
-          (model) => !model.native && model.visible !== false && !disabledSubagents.has(model.slug),
-        ).length
-      : enabledModels.filter(
-          (model) =>
-            !model.native &&
-            model.visible !== false &&
-            (model.multiAgentVersion === "v2" || enabledSubagents.has(model.slug)) &&
-            !disabledSubagents.has(model.slug),
-        ).length;
-    elements.subagentSummary.textContent = `${subagentCount} subagent model${subagentCount === 1 ? "" : "s"} · ${subagent.mode}`;
+      : `<div class="empty-state">${escapeHtml(t("models.enableProviderForSubagents"))}</div>${hiddenSubagentNote}`;
+    const subagentCount = subagentModels.filter(
+      (model) => !disabledSubagents.has(model.slug),
+    ).length;
+    elements.subagentSummary.textContent = t("models.subagentSummary", {
+      count: subagentCount,
+      plural: subagentCount === 1 ? "" : "s",
+      mode: localizeSubagentMode(subagent.mode),
+    });
 
     const pickerGroups = groupModels(pickerModels);
     const pickerRow = (model) => {
         const visible = !hiddenModels.has(model.slug);
         return `<label class="model-setting-row">
           <span><strong>${escapeHtml(model.displayName)}</strong><small>${escapeHtml(model.slug)}</small></span>
-          <span class="provider-check"><input type="checkbox" data-picker="${escapeHtml(model.slug)}" aria-label="Show ${escapeHtml(model.displayName)} in the picker"${visible ? " checked" : ""}${state.modelSettingsBusy ? " disabled" : ""}></span>
+          <span class="provider-check"><input type="checkbox" data-picker="${escapeHtml(model.slug)}" aria-label="${escapeHtml(t("models.showModelAria", { model: model.displayName }))}"${visible ? " checked" : ""}${state.modelSettingsBusy ? " disabled" : ""}></span>
         </label>`;
       };
 
@@ -531,13 +779,41 @@ function startPanel() {
           pickerRow,
           "picker",
           (group) =>
-            `${group.items.filter((model) => !hiddenModels.has(model.slug)).length} of ${
-              group.items.length
-            } visible`,
+            t("models.providerCountVisible", {
+              visible: group.items.filter((model) => !hiddenModels.has(model.slug)).length,
+              total: group.items.length,
+            }),
         )
-      : '<div class="empty-state">No enabled models to show.</div>';
+      : `<div class="empty-state">${escapeHtml(t("models.noEnabledModels"))}</div>`;
     const pickerCount = pickerModels.filter((model) => !hiddenModels.has(model.slug)).length;
-    elements.pickerSummary.textContent = `${pickerCount} visible · ${hiddenModels.size} hidden`;
+    elements.pickerSummary.textContent = `${pickerCount} ${t("models.visible")} · ${hiddenModels.size} ${t("models.hidden")}`;
+  }
+
+  function formatCompactCount(value) {
+    const count = Number(value) || 0;
+    if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+    if (count >= 1_000) return `${(count / 1_000).toFixed(1)}k`;
+    return String(count);
+  }
+
+  function toolResultAgingSavingsLine(stats) {
+    if (!stats || !(Number(stats.requests) > 0)) return "";
+    const tokens = formatCompactCount(stats.estimatedTokensSaved);
+    const mb = ((Number(stats.bytesSaved) || 0) / (1024 * 1024)).toFixed(1);
+    return `Saved ~${tokens} tokens (${mb} MB) across ${stats.requests} requests · `;
+  }
+
+  function renderToolResultAgingSetting() {
+    const aging = state.snapshot?.targets?.codex?.modelSettings?.toolResultAging;
+    const overridden = aging?.environmentOverride === true;
+    elements.toolResultAgingSwitch.checked = aging?.enabled !== false;
+    elements.toolResultAgingSwitch.disabled = state.toolResultAgingBusy || overridden;
+    elements.toolResultAgingSwitchLabel.title = overridden
+      ? t("models.toolAgingForcedOff")
+      : t("models.toolAgingNextRequest");
+    elements.toolResultAgingNote.textContent = overridden
+      ? t("models.toolAgingEnvironment")
+      : `${toolResultAgingSavingsLine(aging?.stats)}${t("models.toolAgingNote")}`;
   }
 
   function renderLocalModels() {
@@ -545,49 +821,246 @@ function startPanel() {
     const installed = local.models || [];
     const download = visibleLocalDownload(local);
     const busy = state.localModelBusy;
+    const activeOperation = download && ["downloading", "uninstalling"].includes(download.status)
+      ? download
+      : null;
+    const operation = busy || (activeOperation
+      ? {
+          kind: activeOperation.status === "uninstalling" ? "uninstall" : "install",
+          tag: activeOperation.tag,
+        }
+      : null);
     elements.localModelSummary.textContent = installed.length
-      ? `${installed.length} installed · ${(Number(local.totalGb) || 0).toFixed(1)} GB`
-      : "none installed";
+      ? t("models.installedSummary", {
+          count: installed.length,
+          size: (Number(local.totalGb) || 0).toFixed(1),
+        })
+      : t("models.noneInstalled");
 
-    elements.localModelOperation.hidden = !busy;
-    if (busy) {
-      const label = busy.kind === "uninstall" ? "Uninstalling" : busy.kind === "install" ? "Installing" : "Applying";
-      elements.localModelOperation.innerHTML = `<span class="operation-pulse" aria-hidden="true"></span><span><strong>${label} local model</strong><small>${escapeHtml(busy.tag)}</small></span><span class="operation-spinner" aria-hidden="true"></span>`;
-      elements.localModelOperation.classList.toggle("is-danger", busy.kind === "uninstall");
+    elements.localModelOperation.hidden = !operation;
+    if (operation) {
+      const label = operation.kind === "uninstall"
+        ? t("status.uninstalling")
+        : operation.kind === "install" ? t("status.installing") : t("status.applying");
+      elements.localModelOperation.innerHTML = `<span class="operation-pulse" aria-hidden="true"></span><span><strong>${escapeHtml(label)} ${escapeHtml(t("models.localModel"))}</strong><small>${escapeHtml(operation.tag)}</small></span><span class="operation-spinner" aria-hidden="true"></span>`;
+      elements.localModelOperation.classList.toggle("is-danger", operation.kind === "uninstall");
     }
 
     if (download) {
-      const running = download.status === "downloading";
+      const running = download.status === "downloading" || download.status === "uninstalling";
+      const removal = download.kind === "uninstall";
       const failed = download.status === "error";
+      const cancelled = download.status === "cancelled";
+      const publicationWarning = !failed && !cancelled && Boolean(download.catalogError || download.restartError);
       const percent = Math.max(0, Math.min(100, Number(download.percent) || 0));
-      const title = failed ? "Local model install failed" : running ? "Installing local model" : "Local model ready";
-      elements.localDownloadStatus.innerHTML = `<div class="download-status${failed ? " is-error" : running ? " is-running" : " is-ready"}">
-        <div><span class="operation-pulse" aria-hidden="true"></span><strong>${title}</strong><span>${failed ? "" : `${percent}%`}</span></div>
-        <small>${escapeHtml(download.tag || "Local model")}${download.error || download.detail ? ` · ${escapeHtml(download.error || download.detail)}` : ""}</small>
-        ${running ? `<progress max="100" value="${percent}" aria-label="Installing ${escapeHtml(download.tag || "local model")} ${percent}%"></progress>` : ""}
+      const title = failed
+        ? (removal ? "Local model removal failed" : t("status.localModelInstallFailed"))
+        : cancelled
+          ? (removal ? "Local model removal cancelled" : "Local model download cancelled")
+          : running
+            ? (removal ? "Uninstalling local model" : "Installing local model")
+            : removal ? "Local model removed" : t("status.localModelReady");
+      const statusClass = failed
+        ? " is-error"
+        : cancelled
+          ? " is-cancelled"
+          : publicationWarning
+            ? " is-warning"
+            : running
+              ? " is-running"
+              : " is-ready";
+      const cancelButton = running && download.tag
+        ? `<button class="mini-button danger" type="button" data-local-action="cancel-operation" data-model="${escapeHtml(download.tag)}"${state.localCancelBusy ? " disabled" : ""}>Cancel</button>`
+        : "";
+      // A terminal download failure/cancellation must be recoverable from the
+      // status card itself.  The install form is still available, but a
+      // one-click retry makes an interrupted pull obvious and avoids making
+      // the operator retype a long Ollama tag or URL.
+      const retryButton = !running && !removal && (failed || cancelled) && download.tag
+        ? `<button class="mini-button" type="button" data-local-action="retry-operation" data-model="${escapeHtml(download.tag)}"${state.localModelBusy || state.localCancelBusy ? " disabled" : ""}>Retry</button>`
+        : "";
+      elements.localDownloadStatus.innerHTML = `<div class="download-status${statusClass}">
+        <div class="download-status-head"><span class="operation-pulse" aria-hidden="true"></span><strong>${title}</strong><span>${failed || cancelled || removal ? "" : `${percent}%`}</span>${cancelButton}${retryButton}</div>
+        <small>${escapeHtml(download.tag || t("models.localLlms"))}${download.error || download.detail ? ` · ${escapeHtml(download.error || localizeDownloadDetail(download.detail))}` : ""}</small>
+        ${running && !removal ? `<progress max="100" value="${percent}" aria-label="${escapeHtml(t("status.installingLocalModel"))} ${escapeHtml(download.tag || t("models.localLlms"))} ${percent}%"></progress>` : ""}
       </div>`;
     } else {
       elements.localDownloadStatus.innerHTML = "";
     }
 
+    const rowBusy = busy || activeOperation || state.localCancelBusy;
     elements.localModelList.innerHTML = installed.length
-      ? installed.map((model) => localModelRow(model, busy)).join("")
-      : '<div class="empty-state local-empty">Nothing installed. Choose a quick pick or enter an Ollama tag below.</div>';
+      ? installed.map((model) => localModelRow(model, rowBusy)).join("")
+      : `<div class="empty-state local-empty">${escapeHtml(t("models.nothingInstalled"))}</div>`;
 
-    const installBusy = Boolean(busy) || download?.status === "downloading";
+    const installBusy = Boolean(rowBusy) || Boolean(activeOperation);
     elements.localModelInput.disabled = installBusy;
     elements.localModelForm.querySelector("button").disabled = installBusy;
-    const picks = (local.available || []).slice(0, 4);
+    const availablePicks = Array.isArray(local.available) ? local.available : [];
+    const picks = state.localQuickPicksExpanded ? availablePicks : availablePicks.slice(0, 4);
+    const morePicks = availablePicks.length > 4
+      ? `<button type="button" class="text-button quick-picks-toggle" data-local-action="toggle-picks">${state.localQuickPicksExpanded ? "Show fewer quick picks" : `Show ${availablePicks.length - 4} more quick picks`}</button>`
+      : "";
     elements.localQuickPicks.innerHTML = picks.length
-      ? `<div class="local-section-label"><span>Quick picks</span><small>recommended for this machine</small></div>${picks
+      ? `<div class="local-section-label"><span>${escapeHtml(t("models.quickPicks"))}</span><small>${escapeHtml(t("models.recommendedForMachine"))}</small></div>${picks
           .map(
             (model) => `<button type="button" class="quick-pick" data-local-action="install" data-model="${escapeHtml(model.tag)}"${installBusy ? " disabled" : ""}>
-              <span><strong>${escapeHtml(model.tag)}</strong><small>${escapeHtml(model.codex === "verified" ? "verified in Codex" : model.fit || "untested")}</small></span>
+              <span><strong>${escapeHtml(model.tag)}</strong><small>${escapeHtml(model.codex === "verified" ? t("models.verifiedInCodex") : model.fit || t("models.untested"))}</small></span>
               <span>${Number(model.sizeGb || 0).toFixed(1)} GB</span>
             </button>`,
           )
-          .join("")}`
+          .join("")}${morePicks}`
       : "";
+    renderLocalCatalog(local, installBusy);
+    const runtime = local.runtime || {};
+    const machine = local.machine ? `<small class="muted-line">${escapeHtml(local.machine)}</small>` : "";
+    elements.localRuntimeActions.innerHTML = runtime.installed
+      ? `<div><small>Ollama ${escapeHtml(runtime.version || "installed")} · headless server ${runtime.running ? "running" : "not started"}</small>${runtime.modelsPath ? `<small class="muted-line">Models: ${escapeHtml(runtime.modelsPath)}</small>` : ""}${machine}</div><button class="text-button" type="button" data-local-runtime-action="update"${state.maintenanceBusy || state.localModelBusy ? " disabled" : ""}>Update Ollama</button>`
+      : `<small>Ollama is not installed. Installing a model can set it up with explicit consent.</small>`;
+  }
+
+  function handleLocalCatalogInput(event) {
+    const input = event.target.closest("input[data-local-catalog-filter]");
+    if (!input) return;
+    state.localCatalogFilter = input.value;
+    renderLocalCatalog(
+      state.localModels || {},
+      Boolean(state.localModelBusy) || state.localCancelBusy || ["downloading", "uninstalling"].includes(state.localModels?.download?.status),
+    );
+    const next = elements.localCatalog.querySelector("input[data-local-catalog-filter]");
+    if (!next) return;
+    next.focus();
+    const cursor = Math.min(state.localCatalogFilter.length, input.selectionStart ?? state.localCatalogFilter.length);
+    next.setSelectionRange(cursor, cursor);
+  }
+
+  function renderLocalCatalog(local, installBusy = false) {
+    const explore = Array.isArray(local.availableExplore) ? local.availableExplore : [];
+    if (!explore.length) {
+      elements.localCatalog.innerHTML = "";
+      return;
+    }
+
+    const query = state.localCatalogFilter.trim().toLocaleLowerCase();
+    const visible = query
+      ? explore.filter((model) => {
+          const searchable = [
+            model.tag,
+            model.family,
+            model.displayName,
+            model.variant,
+            model.note,
+            model.researchStatus,
+            model.researchNote,
+            ...(Array.isArray(model.researchCapabilities) ? model.researchCapabilities : []),
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .toLocaleLowerCase();
+          return searchable.includes(query);
+        })
+      : explore;
+    const groups = new Map();
+    for (const model of visible) {
+      const family = String(model.family || String(model.tag || "").split(":", 1)[0] || "other");
+      if (!groups.has(family)) groups.set(family, []);
+      groups.get(family).push(model);
+    }
+    const familyNames = new Map(
+      (Array.isArray(local.families) ? local.families : []).map((family) => [
+        family.family,
+        String(family.displayName || family.family || "").split(" · ")[0],
+      ]),
+    );
+    const installed = new Set((Array.isArray(local.models) ? local.models : []).map((model) => model.tag));
+    const sortedGroups = [...groups.entries()].sort((left, right) => {
+      const leftName = familyNames.get(left[0]) || left[0];
+      const rightName = familyNames.get(right[0]) || right[0];
+      return leftName.localeCompare(rightName);
+    });
+    const detail = query
+      ? `${visible.length} of ${explore.length} tags · ${sortedGroups.length} families`
+      : `${explore.length} tags · ${sortedGroups.length} families`;
+
+    elements.localCatalog.innerHTML = `
+      <div class="local-catalog-heading">
+        <div class="local-section-label"><span>Discover Ollama</span><small>${escapeHtml(detail)}</small></div>
+        <p>Official catalog snapshot. Search by family, tag, variant, or capability; arbitrary Ollama tags and URLs still work above.</p>
+        <button type="button" class="text-button" data-local-catalog-action="variant-help">${state.localVariantHelpExpanded ? "Hide tag guide" : "What do these tags mean?"}</button>
+        ${state.localVariantHelpExpanded ? '<p class="local-catalog-help">Size tags choose model scale; Q4/Q8/BF16 are weight precision; MLX/NVFP4 are hardware-oriented builds; cloud tags run remotely. Codex compatibility is checked after a pull.</p>' : ""}
+      </div>
+      <div class="local-catalog-search">
+        <input type="search" data-local-catalog-filter value="${escapeHtml(state.localCatalogFilter)}" placeholder="Search all Ollama tags" autocomplete="off" spellcheck="false" aria-label="Search all Ollama tags" />
+        ${query ? '<button class="text-button" type="button" data-local-catalog-clear>Clear</button>' : ""}
+      </div>
+      ${sortedGroups.length ? sortedGroups.map(([family, models]) => {
+        const familyName = familyNames.get(family) || family;
+        const rows = [...models].sort(compareLocalCatalogModels);
+        const fitCount = rows.filter((model) => localCatalogFit(model) === "fits" || localCatalogFit(model) === "tight").length;
+        const cloudCount = rows.filter((model) => model.downloadable === false).length;
+        const familyDetail = `${rows.length} tag${rows.length === 1 ? "" : "s"}${fitCount ? ` · ${fitCount} local` : ""}${cloudCount ? ` · ${cloudCount} cloud` : ""}`;
+        return `<details class="local-catalog-family" open>
+          <summary><span><strong>${escapeHtml(familyName)}</strong><small>${escapeHtml(familyDetail)}</small></span><span class="accordion-chevron" aria-hidden="true"></span></summary>
+          <div class="local-catalog-list">${rows.map((model) => localCatalogRow(model, installed, installBusy)).join("")}</div>
+        </details>`;
+      }).join("") : `<div class="empty-state local-empty">No Ollama tags match “${escapeHtml(state.localCatalogFilter)}”.</div>`}
+    `;
+    const clear = elements.localCatalog.querySelector("[data-local-catalog-clear]");
+    clear?.addEventListener("click", () => {
+      state.localCatalogFilter = "";
+      renderLocalCatalog(
+        state.localModels || {},
+        Boolean(state.localModelBusy) || state.localCancelBusy || ["downloading", "uninstalling"].includes(state.localModels?.download?.status),
+      );
+      elements.localCatalog.querySelector("input[data-local-catalog-filter]")?.focus();
+    });
+  }
+
+  function localCatalogRow(model, installed, installBusy) {
+    const tag = String(model.tag || "");
+    const downloadable = model.downloadable !== false;
+    const tooLarge = downloadable && (model.fit === "too-large" || model.diskFit === "too-large");
+    const fit = localCatalogFit(model);
+    const fitClass = fit === "won’t fit" ? " is-danger" : fit === "tight" ? " is-warning" : "";
+    const capabilities = Array.isArray(model.researchCapabilities) && model.researchCapabilities.length
+      ? ` · ${model.researchCapabilities.join(" · ")}`
+      : "";
+    const title = model.displayName && model.displayName !== tag ? model.displayName : tag;
+    let action;
+    if (!downloadable) {
+      action = '<span class="local-catalog-cloud">Cloud only</span>';
+    } else if (installed.has(tag)) {
+      action = '<span class="local-catalog-installed">Installed</span>';
+    } else {
+      action = `<button class="mini-button${tooLarge ? " danger" : ""}" type="button" data-local-action="install" data-model="${escapeHtml(tag)}"${installBusy ? " disabled" : ""}>${tooLarge ? "Anyway" : "Download"}</button>`;
+    }
+    return `<article class="local-catalog-row${tooLarge ? " is-too-large" : ""}">
+      <div class="local-catalog-copy"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(tag)}${escapeHtml(capabilities)}</small></div>
+      <span class="local-catalog-size">${downloadable ? `${(Number(model.sizeGb) || 0).toFixed(1)} GB` : "cloud"}</span>
+      <span class="local-catalog-fit${fitClass}">${escapeHtml(fit)}</span>
+      ${action}
+    </article>`;
+  }
+
+  function localCatalogFit(model) {
+    if (model.downloadable === false) return "cloud only";
+    if (model.fit === "too-large" || model.diskFit === "too-large") return "won’t fit";
+    if (model.fit === "tight" || model.diskFit === "tight") return "tight";
+    return model.fit || model.diskFit || "untested";
+  }
+
+  function compareLocalCatalogModels(left, right) {
+    const leftLatest = left.variant === "latest";
+    const rightLatest = right.variant === "latest";
+    if (leftLatest !== rightLatest) return leftLatest ? -1 : 1;
+    const fitRank = { fits: 0, tight: 1, "cloud only": 2, "won’t fit": 3 };
+    const leftRank = fitRank[localCatalogFit(left)] ?? 4;
+    const rightRank = fitRank[localCatalogFit(right)] ?? 4;
+    if (leftRank !== rightRank) return leftRank - rightRank;
+    const leftSize = Number(left.sizeGb) || 0;
+    const rightSize = Number(right.sizeGb) || 0;
+    if (leftSize !== rightSize) return leftSize - rightSize;
+    return String(left.tag || "").localeCompare(String(right.tag || ""));
   }
 
   function localModelRow(model, busy) {
@@ -596,15 +1069,19 @@ function startPanel() {
     const speed = model.tokensPerSecond === null || model.tokensPerSecond === undefined
       ? Number.NaN
       : Number(model.tokensPerSecond);
-    const detail = [
-      model.agent === "agent" ? "works in Codex" : model.tools ? "chat untested" : "no tool calling",
-      Number.isFinite(speed) ? `${speed.toFixed(1)} tok/s` : "speed unmeasured",
+      const detail = [
+      model.agent === "agent" ? t("models.worksInCodex") : model.tools ? t("models.chatUntested") : t("models.noToolCalling"),
+      Number.isFinite(speed) ? `${speed.toFixed(1)} tok/s` : t("models.speedUnmeasured"),
     ].join(" · ");
+    const speedAction = `<button class="text-button" type="button" data-local-action="measure-speed" data-model="${escapeHtml(model.tag)}"${state.localBenchmarkBusy ? " disabled" : ""}>Speed</button>`;
+    const visionActions = model.vision
+      ? `<button class="text-button" type="button" data-local-action="test-image" data-model="${escapeHtml(model.tag)}"${state.localBenchmarkBusy ? " disabled" : ""}>Test image</button><button class="text-button" type="button" data-local-action="use-image" data-model="${escapeHtml(model.tag)}"${state.visionBusy ? " disabled" : ""}>${state.visionBridge?.engine === "local" && state.visionBridge?.local?.model === model.tag ? "Using image" : "Use image"}</button>`
+      : "";
     return `<article class="local-model-row${isBusy ? " is-busy" : ""}">
-      <label class="provider-check"><input type="checkbox" data-local-toggle="${escapeHtml(model.tag)}" aria-label="Enable ${escapeHtml(model.tag)} in Codex"${model.enabled ? " checked" : ""}${busy || model.tools !== true ? " disabled" : ""}></label>
+      <label class="provider-check"><input type="checkbox" data-local-toggle="${escapeHtml(model.tag)}" aria-label="${escapeHtml(t("models.enableLocalAria", { model: model.tag }))}"${model.enabled ? " checked" : ""}${busy || model.tools !== true ? " disabled" : ""}></label>
       <div><strong>${escapeHtml(model.tag)}</strong><small>${escapeHtml(detail)}</small></div>
       <span class="local-size">${Number(model.sizeGb || 0).toFixed(1)} GB</span>
-      <button class="mini-button danger" type="button" data-local-action="${armed ? "confirm-remove" : "remove"}" data-model="${escapeHtml(model.tag)}"${busy ? " disabled" : ""}>${armed ? "Confirm" : "Remove"}</button>
+      <div class="local-model-actions">${speedAction}${visionActions}<button class="mini-button danger" type="button" data-local-action="${armed ? "confirm-remove" : "remove"}" data-model="${escapeHtml(model.tag)}"${busy ? " disabled" : ""}>${armed ? escapeHtml(t("actions.confirm")) : escapeHtml(t("actions.remove"))}</button></div>
     </article>`;
   }
 
@@ -612,7 +1089,7 @@ function startPanel() {
     event.preventDefault();
     const model = elements.localModelInput.value.trim();
     if (!model) {
-      showToast("Enter an Ollama model tag or model-page URL.", true);
+      showToast(t("models.enterOllamaTag"), true);
       return;
     }
     elements.localModelInput.value = "";
@@ -620,34 +1097,91 @@ function startPanel() {
   }
 
   async function handleLocalModelClick(event) {
+    const catalogAction = event.target.closest("button[data-local-catalog-action]");
+    if (catalogAction?.dataset.localCatalogAction === "variant-help") {
+      state.localVariantHelpExpanded = !state.localVariantHelpExpanded;
+      renderLocalCatalog(
+        state.localModels || {},
+        Boolean(state.localModelBusy) || state.localCancelBusy || ["downloading", "uninstalling"].includes(state.localModels?.download?.status),
+      );
+      return;
+    }
     const button = event.target.closest("button[data-local-action]");
     if (!button) return;
+    if (button.dataset.localAction === "toggle-picks") {
+      state.localQuickPicksExpanded = !state.localQuickPicksExpanded;
+      renderLocalModels();
+      return;
+    }
     const model = button.dataset.model;
+    if (button.dataset.localAction === "cancel-operation") {
+      await cancelLocalModel(model);
+      return;
+    }
+    if (button.dataset.localAction === "retry-operation") {
+      if (!model || state.localModelBusy || state.localCancelBusy) return;
+      await startLocalInstall(model);
+      return;
+    }
+    if (!model) {
+      showToast("The local model tag is missing. Refresh the panel and try again.", true);
+      return;
+    }
     if (button.dataset.localAction === "install") {
       await startLocalInstall(model);
       return;
     }
+    if (button.dataset.localAction === "measure-speed") {
+      await benchmarkLocalSpeed(model);
+      return;
+    }
+    if (button.dataset.localAction === "test-image") {
+      await benchmarkVisionModel(model);
+      return;
+    }
+    if (button.dataset.localAction === "use-image") {
+      await useLocalVisionModel(model);
+      return;
+    }
     if (button.dataset.localAction === "remove") {
+      if (state.localModelBusy || ["downloading", "uninstalling"].includes(state.localModels?.download?.status)) return;
       state.localRemoveArmed = model;
       renderLocalModels();
       return;
     }
     if (button.dataset.localAction !== "confirm-remove") return;
-    const startedAt = Date.now();
+    if (state.localModelBusy || ["downloading", "uninstalling"].includes(state.localModels?.download?.status)) return;
     state.localRemoveArmed = null;
     state.localModelBusy = { kind: "uninstall", tag: model };
+    state.localModels = {
+      ...(state.localModels || {}),
+      download: { kind: "uninstall", tag: model, status: "uninstalling", detail: "starting", percent: 0 },
+    };
     renderLocalModels();
     try {
       state.localModels = await call("uninstall_local_model", { model });
-      const remaining = 800 - (Date.now() - startedAt);
-      if (remaining > 0) await new Promise((resolve) => window.setTimeout(resolve, remaining));
-      showToast(`${model} removed from this machine.`);
-      await refreshPanel({ quiet: true });
+      await pollLocalOperation(model, "uninstall");
     } catch (error) {
+      try {
+        state.localModels = await call("local_models");
+      } catch {
+        state.localModels = {
+          ...(state.localModels || {}),
+          download: {
+            kind: "uninstall",
+            tag: model,
+            status: "error",
+            detail: "Removal failed",
+            error: errorMessage(error),
+          },
+        };
+      }
       showToast(errorMessage(error), true);
     } finally {
-      state.localModelBusy = null;
-      renderLocalModels();
+      if (!state.localPollTimer) {
+        state.localModelBusy = null;
+        renderLocalModels();
+      }
     }
   }
 
@@ -655,6 +1189,9 @@ function startPanel() {
     const checkbox = event.target.closest("input[data-local-toggle]");
     if (!checkbox) return;
     const model = checkbox.dataset.localToggle;
+    if (!model || state.localModelBusy || state.localCancelBusy || ["downloading", "uninstalling"].includes(state.localModels?.download?.status)) {
+      return;
+    }
     const enabled = checkbox.checked;
     state.localModelBusy = { kind: "toggle", tag: model };
     renderLocalModels();
@@ -670,18 +1207,36 @@ function startPanel() {
   }
 
   async function startLocalInstall(model, { force = false } = {}) {
+    model = String(model || "").trim();
+    if (!model) {
+      showToast("The local model tag is missing. Refresh the panel and try again.", true);
+      return;
+    }
+    const active = state.localModels?.download;
+    if (state.localModelBusy || state.localCancelBusy || ["downloading", "uninstalling"].includes(active?.status)) {
+      showToast(active?.tag === model ? `${model} is already in progress.` : "Another local model operation is already in progress.", true);
+      return;
+    }
     state.localRemoveArmed = null;
     state.localModelBusy = { kind: "install", tag: model };
     state.localModels = {
       ...(state.localModels || {}),
-      download: { tag: model, status: "downloading", detail: "starting", percent: 0 },
+      download: { kind: "download", tag: model, status: "downloading", detail: "starting", percent: 0 },
     };
     renderLocalModels();
     try {
       // The router installs and starts Ollama headlessly as part of this call
       // when it is missing, so one action covers the runtime and the model.
-      await call("install_local_model", { model, force });
-      await pollLocalInstall(model);
+      const result = await call("install_local_model", { model, force });
+      const operationTag = String(result?.tag || model);
+      if (operationTag !== model) {
+        state.localModels = {
+          ...(state.localModels || {}),
+          download: { ...(state.localModels?.download || {}), tag: operationTag },
+        };
+        renderLocalModels();
+      }
+      await pollLocalInstall(operationTag);
     } catch (error) {
       const detail = errorMessage(error);
       try {
@@ -692,7 +1247,7 @@ function startPanel() {
       // A model rated too large is refused once, not hidden. Ask, then retry
       // with the override so every catalog entry stays installable.
       if (!force && detail.includes("--force")) {
-        if (window.confirm(`${detail}\n\nDownload ${model} anyway?`)) {
+        if (window.confirm(`${detail}\n\n${t("models.downloadAnyway", { model })}`)) {
           await startLocalInstall(model, { force: true });
         }
         return;
@@ -702,24 +1257,175 @@ function startPanel() {
   }
 
   async function pollLocalInstall(model) {
+    await pollLocalOperation(model, "install");
+  }
+
+  async function pollLocalOperation(model, kind) {
     window.clearTimeout(state.localPollTimer);
     try {
       state.localModels = await call("local_models");
       renderLocalModels();
       const download = state.localModels?.download;
-      if (download?.status === "downloading") {
-        state.localPollTimer = window.setTimeout(() => pollLocalInstall(model), 1_000);
+      if (download?.tag === model && ["downloading", "uninstalling"].includes(download.status)) {
+        state.localPollTimer = window.setTimeout(() => pollLocalOperation(model, kind), 1_000);
         return;
       }
+      state.localPollTimer = null;
       state.localModelBusy = null;
       if (download?.status === "done") {
-        showToast(`${download.tag || model} is ready. Restart Codex to refresh its model picker.`);
+        showToast(kind === "uninstall" ? t("models.localModelRemoved", { model: download.tag || model }) : t("models.localModelReadyRestart", { model: download.tag || model }));
+      } else if (download?.status === "cancelled") {
+        showToast(kind === "uninstall" ? `${download.tag || model} removal cancelled.` : `${download.tag || model} download cancelled.`);
       } else if (download?.status === "error") {
-        showToast(download.error || "The local model install failed.", true);
+        showToast(download.error || t("models.localModelInstallError"), true);
       }
       await refreshPanel({ quiet: true });
     } catch (error) {
-      state.localPollTimer = window.setTimeout(() => pollLocalInstall(model), 1_500);
+      state.localPollTimer = window.setTimeout(() => pollLocalOperation(model, kind), 1_500);
+    }
+  }
+
+  async function cancelLocalModel(model) {
+    if (state.localCancelBusy) return;
+    state.localCancelBusy = true;
+    window.clearTimeout(state.localPollTimer);
+    state.localPollTimer = null;
+    renderLocalModels();
+    try {
+      const result = await call("cancel_local_model", { model });
+      state.localModels = await call("local_models");
+      showToast(result?.cancelled ? `${model} operation cancelled.` : "No local model operation is running.");
+    } catch (error) {
+      showToast(errorMessage(error), true);
+    } finally {
+      state.localCancelBusy = false;
+      state.localModelBusy = null;
+      await refreshPanel({ quiet: true });
+    }
+  }
+
+  async function handleLocalRuntimeClick(event) {
+    const button = event.target.closest("button[data-local-runtime-action]");
+    if (!button || button.dataset.localRuntimeAction !== "update" || state.maintenanceBusy) return;
+    state.maintenanceBusy = "ollama";
+    renderMaintenance();
+    renderLocalModels();
+    try {
+      await call("update_local_ollama");
+      showToast("Ollama updated. Its headless server will be reused for local models.");
+      await refreshPanel({ quiet: true });
+    } catch (error) {
+      showToast(errorMessage(error), true);
+    } finally {
+      state.maintenanceBusy = null;
+      renderMaintenance();
+      renderLocalModels();
+    }
+  }
+
+  async function benchmarkLocalSpeed(model) {
+    if (!model || state.localBenchmarkBusy || state.localModelBusy) return;
+    state.localBenchmarkBusy = { kind: "speed", tag: model };
+    renderLocalModels();
+    try {
+      await call("local_model_speed", { model });
+      showToast(`${model} speed measured.`);
+      await refreshPanel({ quiet: true });
+    } catch (error) {
+      showToast(errorMessage(error), true);
+    } finally {
+      state.localBenchmarkBusy = null;
+      renderLocalModels();
+    }
+  }
+
+  async function benchmarkVisionModel(model) {
+    if (!model || state.localBenchmarkBusy || state.localModelBusy) return;
+    state.localBenchmarkBusy = { kind: "vision", tag: model };
+    renderLocalModels();
+    renderVisionBridge();
+    try {
+      await call("benchmark_vision_model", { model });
+      showToast(`${model} image reading tested.`);
+      await refreshPanel({ quiet: true });
+    } catch (error) {
+      showToast(errorMessage(error), true);
+    } finally {
+      state.localBenchmarkBusy = null;
+      renderLocalModels();
+      renderVisionBridge();
+    }
+  }
+
+  async function useLocalVisionModel(model) {
+    if (!model || state.visionBusy) return;
+    state.visionBusy = true;
+    renderVisionBridge();
+    renderLocalModels();
+    try {
+      await call("use_local_vision_model", { model });
+      showToast(`${model} is now the local image reader.`);
+      await refreshPanel({ quiet: true });
+    } catch (error) {
+      showToast(errorMessage(error), true);
+    } finally {
+      state.visionBusy = false;
+      renderVisionBridge();
+      renderLocalModels();
+    }
+  }
+
+  async function handleVisionClick(event) {
+    const button = event.target.closest("button[data-vision-action]");
+    if (!button) return;
+    const model = button.dataset.model;
+    if (!model) return;
+    if (button.dataset.visionAction === "use") {
+      await useLocalVisionModel(model);
+    } else if (button.dataset.visionAction === "benchmark") {
+      await benchmarkVisionModel(model);
+    } else if (button.dataset.visionAction === "download") {
+      await startVisionDownload(model);
+    }
+  }
+
+  async function startVisionDownload(model) {
+    if (!model || state.visionBusy || state.visionDownload?.status === "downloading") return;
+    state.visionBusy = true;
+    state.visionDownload = { tag: model, status: "downloading", percent: 0, detail: "starting" };
+    renderVisionBridge();
+    try {
+      await call("pull_vision_model", { model });
+      pollVisionDownload(model);
+    } catch (error) {
+      state.visionBusy = false;
+      state.visionDownload = { tag: model, status: "error", error: errorMessage(error) };
+      renderVisionBridge();
+      showToast(errorMessage(error), true);
+    }
+  }
+
+  async function pollVisionDownload(model) {
+    window.clearTimeout(state.visionPollTimer);
+    try {
+      const status = await call("vision_pull_status");
+      state.visionDownload = status;
+      renderVisionBridge();
+      if (status?.tag === model && status.status === "downloading") {
+        state.visionPollTimer = window.setTimeout(() => pollVisionDownload(model), 1_000);
+        return;
+      }
+      state.visionPollTimer = null;
+      state.visionBusy = false;
+      if (status?.status === "done") {
+        showToast(`${model} downloaded for image reading.`);
+        await refreshPanel({ quiet: true });
+      } else if (status?.status === "error") {
+        showToast(status.error || "The vision model download failed.", true);
+      }
+      renderVisionBridge();
+    } catch {
+      state.visionPollTimer = window.setTimeout(() => pollVisionDownload(model), 1_500);
     }
   }
 
@@ -732,7 +1438,7 @@ function startPanel() {
     renderModelSettings();
     try {
       state.snapshot = await call("set_subagent_mode", { mode });
-      showToast(enabled ? "All enabled models can now run as subagents." : "Subagent mode updated.");
+      showToast(enabled ? t("models.allSubagentsEnabled") : t("models.subagentModeUpdated"));
       await refreshPanel({ quiet: true });
     } catch (error) {
       elements.subagentAllSwitch.checked = !enabled;
@@ -759,8 +1465,8 @@ function startPanel() {
         }
         showToast(
           setting === "subagents"
-            ? `${provider} models ${enabled ? "on" : "off"} as subagents. They stay in Codex's picker. Restart Codex to refresh its subagents.`
-            : `${provider} models ${enabled ? "shown in" : "hidden from"} the picker. Restart Codex to refresh it.`,
+            ? t(enabled ? "models.providerSubagentsOn" : "models.providerSubagentsOff", { provider })
+            : t(enabled ? "models.providerShown" : "models.providerHidden", { provider }),
         );
         await refreshPanel({ quiet: true });
       } catch (error) {
@@ -781,15 +1487,11 @@ function startPanel() {
       if (group === "subagents") {
         const selectAll = action === "select-all";
         state.snapshot = await call("set_subagent_selection", { selectAll });
-        showToast(
-          `${selectAll ? "Every picker-visible model can now run as a subagent." : "Subagent selection cleared. Models stay in Codex's picker."} Restart Codex to refresh its subagents.`,
-        );
+        showToast(t(selectAll ? "models.everyPickerModelSubagent" : "models.subagentSelectionCleared"));
       } else {
         const showAll = action === "show-all";
         state.snapshot = await call("set_picker_models", { showAll });
-        showToast(
-          `${showAll ? "Every model is visible in the picker." : "All models hidden from the picker."} Restart Codex to refresh it.`,
-        );
+        showToast(t(showAll ? "models.everyModelVisible" : "models.allModelsHidden"));
       }
       await refreshPanel({ quiet: true });
     } catch (error) {
@@ -812,15 +1514,13 @@ function startPanel() {
           slug: subagent.dataset.subagent,
           enabled: subagent.checked,
         });
-        showToast(
-          "Subagent selection updated. The model stays in Codex's picker. Restart Codex to refresh its subagents.",
-        );
+        showToast(t("models.subagentSelectionUpdated"));
       } else {
         state.snapshot = await call("set_picker_model", {
           slug: picker.dataset.picker,
           visible: picker.checked,
         });
-        showToast("Model picker updated. Restart Codex to refresh its picker.");
+        showToast(t("models.pickerUpdated"));
       }
       await refreshPanel({ quiet: true });
     } catch (error) {
@@ -840,13 +1540,16 @@ function startPanel() {
     const action = button.dataset.action;
     if (action === "key") {
       const setup = state.providerSetup?.providers?.find((item) => item.id === provider);
-      const credentialLabel = setup?.credentialLabel || "API key";
-      const credentialNoun = credentialLabel === "API key" ? "key" : credentialLabel;
+      const isApiKey = !setup?.credentialLabel || setup.credentialLabel === "API key" || setup.credentialLabel === t("connections.apiKey");
+      const credentialLabel = isApiKey
+        ? t("connections.apiKey")
+        : setup.credentialLabel === "GitHub token" ? t("connections.githubToken") : setup.credentialLabel;
+      const credentialNoun = credentialLabel;
       state.keyProvider = provider;
       elements.keyTitle.textContent = setup?.configured
-        ? `Replace ${setup.displayName} ${credentialNoun}`
-        : `Add ${setup?.displayName || "API"} ${credentialNoun}`;
-      elements.keyInput.placeholder = `Paste ${credentialLabel.toLowerCase()}`;
+        ? t("connections.replaceCredentialTitle", { provider: setup.displayName, credential: credentialNoun })
+        : t("connections.addCredentialTitle", { provider: setup?.displayName || "API", credential: credentialNoun });
+      elements.keyInput.placeholder = t("connections.pasteCredentialType", { credential: credentialNoun });
       elements.keyDialog.showModal();
       requestAnimationFrame(() => elements.keyInput.focus());
       return;
@@ -854,12 +1557,15 @@ function startPanel() {
 
     if (action === "remove-key") {
       const setup = state.providerSetup?.providers?.find((item) => item.id === provider);
-      const name = setup?.displayName || "this provider";
-      const credentialLabel = setup?.credentialLabel || "API key";
-      const credentialNoun = credentialLabel === "API key" ? "key" : credentialLabel;
+      const name = setup?.displayName || t("general.provider");
+      const isApiKey = !setup?.credentialLabel || setup.credentialLabel === "API key" || setup.credentialLabel === t("connections.apiKey");
+      const credentialLabel = isApiKey
+        ? t("connections.apiKey")
+        : setup.credentialLabel === "GitHub token" ? t("connections.githubToken") : setup.credentialLabel;
+      const credentialNoun = credentialLabel;
       state.removeProvider = provider;
-      elements.removeTitle.textContent = `Remove ${name} ${credentialNoun}`;
-      elements.removeBody.textContent = `The stored ${name} ${credentialLabel.toLowerCase()} is deleted from this machine and ${name} is hidden from the Codex model picker. You can add a new credential at any time.`;
+      elements.removeTitle.textContent = t("connections.removeCredentialTitle", { provider: name, credential: credentialNoun });
+      elements.removeBody.textContent = t("connections.removeBodyDynamic", { provider: name, credential: credentialNoun });
       elements.removeDialog.showModal();
       requestAnimationFrame(() => elements.cancelRemove.focus());
       return;
@@ -868,12 +1574,15 @@ function startPanel() {
     state.busyProvider = provider;
     renderProviders();
     try {
-      if (action === "install") {
-        await call("install_provider_cli", { provider });
-        showToast("Official provider CLI installed. Sign in to continue.");
-      } else if (action === "login") {
+      if (action === "connect") {
+        const setup = state.providerSetup?.providers?.find((item) => item.id === provider);
+        // OAuth setup is intentionally one click: if the official CLI is not
+        // present, install it and continue straight into its browser login.
+        // Leaving the user at an "installed" state made the Windows tray
+        // differ from the native Mac companion and invited duplicate clicks.
+        if (!setup?.cliInstalled) await call("install_provider_cli", { provider });
         await call("connect_oauth", { provider });
-        showToast("Provider connected. Restart Codex to refresh its model picker.");
+        showToast(t("connections.providerConnected"));
       }
       await refreshPanel({ quiet: true });
     } catch (error) {
@@ -893,7 +1602,7 @@ function startPanel() {
     state.busyProvider = provider;
     try {
       state.snapshot = await call("set_provider_enabled", { provider, enabled });
-      showToast(enabled ? "Provider enabled." : "Provider hidden from Codex.");
+      showToast(enabled ? t("connections.providerEnabled") : t("connections.providerHidden"));
       await refreshPanel({ quiet: true });
     } catch (error) {
       checkbox.checked = !enabled;
@@ -926,8 +1635,8 @@ function startPanel() {
       state.snapshot = await call("set_login_free", { enabled });
       showToast(
         enabled
-          ? "OpenAI login disabled for new Codex sessions. Restart Codex to apply."
-          : "OpenAI login restored for new Codex sessions. Restart Codex to apply.",
+          ? t("connections.openAILoginDisabled")
+          : t("connections.openAILoginRestored"),
       );
     } catch (error) {
       elements.loginFreeSwitch.checked = !enabled;
@@ -935,6 +1644,141 @@ function startPanel() {
     } finally {
       state.loginFreeBusy = false;
       renderLoginFreeSetting();
+    }
+  }
+
+  async function handleSignedRoutingToggle() {
+    const enabled = elements.signedRoutingSwitch.checked;
+    state.signedRoutingBusy = true;
+    renderSignedRouting();
+    try {
+      state.snapshot = await call("set_signed_routing", { enabled });
+      showToast(
+        enabled
+          ? "Signed routing enabled. Restart Codex to apply the native-plus-router transport."
+          : "Signed routing disabled. Restart Codex to restore the native transport.",
+      );
+      await refreshPanel({ quiet: true });
+    } catch (error) {
+      elements.signedRoutingSwitch.checked = !enabled;
+      showToast(errorMessage(error), true);
+    } finally {
+      state.signedRoutingBusy = false;
+      renderSignedRouting();
+    }
+  }
+
+  async function handlePresenceModeChange() {
+    const mode = elements.presenceMode.value || "always";
+    const previous = state.presence?.mode || "always";
+    state.presenceBusy = true;
+    renderPresence();
+    try {
+      state.presence = await call("set_presence_mode", { mode });
+      showToast(mode === "follow-codex" ? "Tray will follow Codex presence." : "Tray will stay visible.");
+    } catch (error) {
+      elements.presenceMode.value = previous;
+      showToast(errorMessage(error), true);
+    } finally {
+      state.presenceBusy = false;
+      renderPresence();
+    }
+  }
+
+  async function handleVisionToggle() {
+    const enabled = elements.visionSwitch.checked;
+    state.visionBusy = true;
+    renderVisionBridge();
+    try {
+      state.visionBridge = await call("set_vision_bridge", { enabled });
+      showToast(enabled ? "Vision bridge enabled for pasted images." : "Vision bridge disabled.");
+      await refreshPanel({ quiet: true });
+    } catch (error) {
+      elements.visionSwitch.checked = !enabled;
+      showToast(errorMessage(error), true);
+    } finally {
+      state.visionBusy = false;
+      renderVisionBridge();
+    }
+  }
+
+  async function handleVisionEngineChange() {
+    const engine = elements.visionEngine.value || "auto";
+    const effort = elements.visionEffort.value || "default";
+    state.visionBusy = true;
+    renderVisionBridge();
+    try {
+      state.visionBridge = await call("set_vision_engine", { engine, effort });
+      showToast(engine === "local" ? "Local vision model selected." : "Vision engine selected.");
+      await refreshPanel({ quiet: true });
+    } catch (error) {
+      showToast(errorMessage(error), true);
+    } finally {
+      state.visionBusy = false;
+      renderVisionBridge();
+    }
+  }
+
+  async function handleVisionEffortChange() {
+    const effort = elements.visionEffort.value || "default";
+    state.visionBusy = true;
+    renderVisionBridge();
+    try {
+      state.visionBridge = await call("set_vision_effort", { effort });
+      showToast(effort === "default" ? "Vision effort reset to model default." : `Vision effort set to ${effort}.`);
+      await refreshPanel({ quiet: true });
+    } catch (error) {
+      showToast(errorMessage(error), true);
+    } finally {
+      state.visionBusy = false;
+      renderVisionBridge();
+    }
+  }
+
+  async function runMaintenance(kind) {
+    if (state.maintenanceBusy) return;
+    state.maintenanceBusy = kind;
+    state.maintenanceResult = null;
+    renderMaintenance();
+    try {
+      const result = await call(kind === "fix" ? "doctor_fix" : "maintenance");
+      state.maintenanceResult = {
+        ok: result?.ok !== false,
+        message: kind === "fix"
+          ? "Repair completed and the installation was verified."
+          : result?.restartRequired
+            ? "Updated and verified. Restart Codex to load the refreshed catalog."
+            : "Updated and verified.",
+      };
+      showToast(state.maintenanceResult.message);
+      await refreshPanel({ quiet: true });
+    } catch (error) {
+      state.maintenanceResult = { ok: false, error: true, message: errorMessage(error) };
+      showToast(errorMessage(error), true);
+    } finally {
+      state.maintenanceBusy = null;
+      renderMaintenance();
+    }
+  }
+
+  async function handleToolResultAgingToggle() {
+    const enabled = elements.toolResultAgingSwitch.checked;
+    state.toolResultAgingBusy = true;
+    renderToolResultAgingSetting();
+    try {
+      await call("set_tool_result_aging", { enabled });
+      await refreshPanel({ quiet: true });
+      showToast(
+        enabled
+          ? t("models.toolAgingOn")
+          : t("models.toolAgingExact"),
+      );
+    } catch (error) {
+      elements.toolResultAgingSwitch.checked = !enabled;
+      showToast(errorMessage(error), true);
+    } finally {
+      state.toolResultAgingBusy = false;
+      renderToolResultAgingSetting();
     }
   }
 
@@ -949,7 +1793,7 @@ function startPanel() {
     renderProviders();
     try {
       await call("save_api_key", { provider, apiKey });
-      showToast("Credential saved. Restart Codex to refresh its model picker.");
+      showToast(t("connections.credentialSaved"));
       await refreshPanel({ quiet: true });
     } catch (error) {
       showToast(errorMessage(error), true);
@@ -1028,7 +1872,7 @@ function startIsland() {
   elements.root.addEventListener("click", () => call("show_panel"));
 
   if (!invoke) {
-    elements.state.textContent = "Unavailable";
+    elements.state.textContent = t("status.unavailable");
     elements.root.dataset.state = "offline";
     return;
   }
@@ -1078,15 +1922,9 @@ function startIsland() {
   function renderIsland() {
     const activity = state.health?.activity || {};
     const activityState = state.health?.ok === false ? "offline" : activity.state || "idle";
-    const labels = {
-      generating: "Thinking",
-      starting: "Starting",
-      offline: "Offline",
-      error: "Error",
-      idle: "Idle",
-    };
+    const labels = activityLabels();
     elements.root.dataset.state = activityState;
-    elements.state.textContent = labels[activityState] || "Idle";
+    elements.state.textContent = labels[activityState] || t("status.idle");
     if (elements.orbit) {
       const orbMode = {
         generating: "composing",
@@ -1102,16 +1940,16 @@ function startIsland() {
     const source = options.find((option) => option.id === requested) || options[0];
     elements.provider.textContent = activityState === "generating" && activity.model
       ? activity.model
-      : source?.name || "Model Router";
+      : source?.name || t("island.modelRouter");
     elements.tokens.textContent = source ? compactTokens(todayTokens(source)) : "—";
-    elements.week.textContent = source ? `${compactTokens(sevenDayTokens(source))} tokens` : "No usage yet";
+    elements.week.textContent = source ? `${compactTokens(sevenDayTokens(source))} ${t("usage.tokens")}` : t("island.noUsageYet");
 
     const weekly = buildQuotaCards(state).find(
       (card) => card.providerId === source?.id && card.window === "weekly",
     );
-    elements.percent.textContent = weekly?.usedPercent === null || weekly?.usedPercent === undefined
+    elements.percent.textContent = weekly?.remainingPercent === null || weekly?.remainingPercent === undefined
       ? "—"
-      : `${Math.round(weekly.usedPercent)}%`;
+      : `${Math.round(weekly.remainingPercent)}%`;
 
     const series = dailySeries(source?.buckets || []);
     const geometry = chartGeometry(series, 368, 42, 3);
@@ -1119,7 +1957,12 @@ function startIsland() {
     elements.area.setAttribute("d", geometry.area);
     elements.root.setAttribute(
       "aria-label",
-      `${labels[activityState] || "Idle"}. ${source ? `${exactTokens(todayTokens(source))} tokens today.` : "No usage data."}`,
+      t("island.ariaLabel", {
+        state: labels[activityState] || t("status.idle"),
+        details: source
+          ? t("island.tokensToday", { count: exactTokens(todayTokens(source)) })
+          : t("usage.noUsageData"),
+      }),
     );
   }
 
@@ -1136,6 +1979,40 @@ function startIsland() {
   }
 }
 
+function activityLabels() {
+  return {
+    generating: t("status.thinking"),
+    starting: t("status.starting"),
+    offline: t("status.offline"),
+    error: t("status.error"),
+    idle: t("status.idle"),
+  };
+}
+
+function localizeProviderPlan(note) {
+  const value = String(note || "");
+  if (getLanguage() === "zh-CN") {
+    if (value.includes("Needs the Command Code Provider plan")) return "需要 Command Code Provider 方案。";
+    if (value.includes("Requires Copilot access")) return "需要 Copilot 访问权限。连接后，请运行 ./bin/curate-models github-copilot。";
+    if (value.includes("Requires an active ClinePass subscription")) return "需要有效的 ClinePass 订阅。";
+    if (value.includes("Runs on this machine")) return "在此设备上运行。使用这些模型前请先启动 Ollama。";
+  }
+  return value;
+}
+
+function localizeSubagentMode(mode) {
+  const key = {
+    proven: "models.modeProven",
+    selected: "models.modeSelected",
+    all: "models.modeAll",
+  }[mode];
+  return key ? t(key) : mode || t("models.modeProven");
+}
+
+function localizeDownloadDetail(detail) {
+  return detail === "starting" ? t("models.downloadStarting") : detail;
+}
+
 function renderChart(series, elements) {
   const geometry = chartGeometry(series);
   elements.chartLine.setAttribute("d", geometry.line);
@@ -1145,6 +2022,7 @@ function renderChart(series, elements) {
     elements.chartLine.style.animation = "";
   });
   elements.chartDays.innerHTML = series.map((point) => `<span>${escapeHtml(point.label)}</span>`).join("");
+  elements.chartDays.style.gridTemplateColumns = `repeat(${Math.max(1, series.length)}, minmax(0, 1fr))`;
   elements.chartPoints.replaceChildren();
   geometry.points.forEach((point, index) => {
     const dot = svgElement("circle", {
@@ -1164,7 +2042,9 @@ function renderChart(series, elements) {
       elements.chartPoints.querySelectorAll(".chart-point").forEach((item) => item.classList.remove("is-active"));
       dot.classList.add("is-active");
       elements.chartTooltip.querySelector("span").textContent = series[index].longLabel;
-      elements.chartTooltip.querySelector("strong").textContent = `${exactTokens(series[index].tokens)} tokens`;
+      elements.chartTooltip.querySelector("strong").textContent = t("usage.tooltipTokens", {
+        count: exactTokens(series[index].tokens),
+      });
       elements.chartTooltip.style.left = `${(point.x / 328) * 100}%`;
       elements.chartTooltip.style.top = `${point.y}px`;
       elements.chartTooltip.hidden = false;
@@ -1186,25 +2066,28 @@ function svgElement(name, attributes) {
 }
 
 function call(command, args) {
-  if (!invoke) return Promise.reject(new Error("Desktop bridge unavailable."));
+  if (!invoke) return Promise.reject(new Error(t("status.desktopBridgeUnavailable")));
   return invoke(command, args);
 }
 
 // A key can also come from the macOS Keychain or the environment, which the
 // router cannot delete, so say so rather than reporting a clean disconnect.
 function removalMessage(removal) {
-  const name = removal?.displayName || "The provider";
+  const name = removal?.displayName || t("general.provider");
   if (removal?.stillConfigured) {
-    return `${name} key removed from local storage, but a key is still active from ${removal.remainingSource || "another source"}.`;
+    return t("general.keyRemovedStillActive", {
+      provider: name,
+      source: removal.remainingSource || t("general.anotherSource"),
+    });
   }
   if (removal && removal.removedFiles === 0) {
-    return `No stored ${name} key was found.`;
+    return t("general.noStoredKey", { provider: name });
   }
-  return `${name} key removed. Restart Codex to refresh its model picker.`;
+  return t("general.keyRemovedRestart", { provider: name });
 }
 
 function errorMessage(error) {
-  const message = typeof error === "string" ? error : error?.message || "The operation could not be completed.";
+  const message = typeof error === "string" ? error : error?.message || t("general.operationFailed");
   return String(message).replace(/\s+/g, " ").trim().slice(0, 500);
 }
 

@@ -86,13 +86,38 @@ test("a companion left inside a checkout is migrated, not abandoned", () => {
   }
 });
 
-test("Windows has no companion to keep in sync", () => {
+// Windows has a companion now, and it is the one platform whose tray must be
+// built deliberately -- so it was also the one that never recorded having been
+// built, and every update would have rebuilt it from scratch.
+test("a Windows companion is kept in sync like the others", () => {
   const home = scratch();
+  const fakeRoot = scratch();
+  const release = path.join(fakeRoot, "apps", "desktop", "src-tauri", "target", "release");
+  const rust = path.join(fakeRoot, "apps", "desktop", "src-tauri", "src");
   try {
-    assert.equal(trayRebuildPlan({ root, platform: "win32", home }), "unsupported");
+    mkdirSync(rust, { recursive: true });
+    writeFileSync(path.join(rust, "main.rs"), "fn main() {}\n", "utf8");
+
+    // Nothing built yet: an update must not install one unasked.
+    assert.equal(trayRebuildPlan({ root: fakeRoot, platform: "win32", home }), "absent");
+
+    mkdirSync(release, { recursive: true });
+    writeFileSync(path.join(release, "codex-router-desktop.exe"), "binary", "utf8");
+    assert.equal(trayRebuildPlan({ root: fakeRoot, platform: "win32", home }), "rebuild");
+
+    recordTrayBuild({ root: fakeRoot, platform: "win32", home });
+    assert.equal(trayRebuildPlan({ root: fakeRoot, platform: "win32", home }), "skip");
+
+    writeFileSync(path.join(rust, "main.rs"), "fn main() { /* changed */ }\n", "utf8");
+    assert.equal(trayRebuildPlan({ root: fakeRoot, platform: "win32", home }), "rebuild");
   } finally {
     rmSync(home, { recursive: true, force: true });
+    rmSync(fakeRoot, { recursive: true, force: true });
   }
+});
+
+test("a platform with no companion at all stays unsupported", () => {
+  assert.equal(trayRebuildPlan({ root, platform: "aix", home: scratch() }), "unsupported");
 });
 
 // trayDecision offers the companion on Linux too. Answering "unsupported"
@@ -124,14 +149,26 @@ test("a Linux companion is kept in sync like the macOS one", () => {
   }
 });
 
-test("each platform fingerprints its own sources", () => {
+test("each companion fingerprints its own sources", () => {
   // A shared fingerprint would make a Swift edit look like a reason to rebuild
   // the Tauri app, and vice versa.
   assert.notEqual(
     traySourceFingerprint(root, "darwin"),
     traySourceFingerprint(root, "linux"),
   );
-  assert.equal(traySourceFingerprint(root, "win32"), "");
+  assert.notEqual(
+    traySourceFingerprint(root, "darwin"),
+    traySourceFingerprint(root, "win32"),
+  );
+  // Windows and Linux are the same Tauri project, so they deliberately agree:
+  // one edit to the UI or the Rust makes both stale, which is correct.
+  assert.equal(
+    traySourceFingerprint(root, "win32"),
+    traySourceFingerprint(root, "linux"),
+  );
+  assert.notEqual(traySourceFingerprint(root, "win32"), "");
+  // A platform with no companion has nothing to fingerprint.
+  assert.equal(traySourceFingerprint(root, "aix"), "");
 });
 
 test("one companion location: the Node and shell sides name the same directory", () => {
@@ -248,4 +285,91 @@ test("every tray assertion names its platform instead of inheriting the host", (
   for (const call of self.match(/trayRebuildPlan\(\{[^}]*\}\)/g) ?? []) {
     assert.match(call, /platform:/, `missing explicit platform: ${call}`);
   }
+});
+
+// Regression for #180. The mode decision itself is covered by real Swift tests
+// (apps/macos/ModelRouterTray/Tests/IslandModeTests.swift), which CI runs on
+// the macOS matrix leg -- asserting on the source text of an initializer only
+// ever proved the source said something. What stays here is the wiring those
+// Swift tests cannot see.
+test("the tray ships a Swift test target and CI runs it", () => {
+  const manifest = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Package.swift"),
+    "utf8",
+  );
+  assert.match(manifest, /\.testTarget\(\s*\n\s*name: "ModelRouterTrayTests"/);
+
+  const workflow = readFileSync(path.join(root, ".github", "workflows", "ci.yml"), "utf8");
+  assert.match(workflow, /working-directory: apps\/macos\/ModelRouterTray\s+run: swift test/);
+  assert.match(workflow, /if: runner\.os == 'macOS'/);
+});
+
+test("the island mode decision stays pure, so it stays testable", () => {
+  const source = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
+    "utf8",
+  );
+  // nonisolated because it reads no stored state; if someone reaches for
+  // `defaults` inside it, that stops being true and the Swift tests stop
+  // being able to call it.
+  assert.match(source, /nonisolated static func resolveIslandMode\(/);
+  const declaration = source.slice(source.indexOf("nonisolated static func resolveIslandMode("));
+  const initIndex = declaration.search(/\r?\n  init\(\)/);
+  assert.ok(initIndex > 0, "resolveIslandMode still sits above init()");
+  assert.doesNotMatch(declaration.slice(0, initIndex), /defaults\./);
+});
+
+test("only one process may draw the Island overlay", () => {
+  const source = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "IslandOverlay.swift"),
+    "utf8",
+  );
+  // An unbundled `swift run` binary has no identifier, reads a different
+  // UserDefaults domain, and could never see the preference change -- it must
+  // never claim the overlay.
+  assert.match(source, /guard let identifier = Bundle\.main\.bundleIdentifier else \{ return false \}/);
+  assert.match(source, /NSRunningApplication\.runningApplications\(withBundleIdentifier: identifier\)/);
+  assert.match(source, /if visible && ownsOverlay \{/);
+});
+
+test("the docs no longer claim the Island is on by default", () => {
+  const trayDoc = readFileSync(path.join(root, "docs", "MACOS-TRAY.md"), "utf8");
+  assert.doesNotMatch(trayDoc, /Island is shown by default/);
+  assert.match(trayDoc, /off on a new install/);
+});
+
+// The tray dictionary is keyed on the English source string, so a new
+// routerLocalized("...") literal is silently English-only until somebody
+// remembers to add it. That is exactly how "Fix Codex Router installation"
+// shipped untranslated. Check every literal against the dictionary here,
+// where it is cheap, instead of noticing it in a screenshot.
+test("every localized tray literal has a Chinese translation", () => {
+  const sources = ["ModelRouterTrayApp.swift", "IslandOverlay.swift", "ThinkingOrbCanvas.swift"]
+    .map((name) =>
+      readFileSync(
+        path.join(root, "apps", "macos", "ModelRouterTray", "Sources", name),
+        "utf8",
+      ),
+    )
+    .join("\n");
+  const catalog = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "Localization.swift"),
+    "utf8",
+  );
+
+  // Only literal call sites can be checked statically; the handful that pass a
+  // variable are localized at whatever assigns them.
+  const literals = new Set(
+    [...sources.matchAll(/router(?:Localized|Format)\(\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]),
+  );
+  assert.ok(literals.size > 100, `expected a full catalog, found ${literals.size}`);
+
+  const translated = new Set(
+    [...catalog.matchAll(/^\s*"((?:[^"\\]|\\.)*)":\s*"/gm)].map((m) => m[1]),
+  );
+
+  // Brand names are deliberately identical in both languages.
+  const untranslatable = new Set(["CODEX"]);
+  const missing = [...literals].filter((k) => !translated.has(k) && !untranslatable.has(k));
+  assert.deepEqual(missing, [], `untranslated tray strings: ${missing.join(" | ")}`);
 });

@@ -95,8 +95,14 @@ map, which restores native GPT routing.
 | DeepSeek V4 Pro Ollama Cloud | `ollama-cloud/deepseek-v4-pro` | `ollama-cloud-deepseek-v4-pro` | `deepseek-v4-pro` |
 | Qwen3.7 Max Plan | `qwen-plan/qwen3.7-max` | `qwen-plan-qwen3-7-max` | `qwen3.7-max` |
 | Qwen3.7 Plus Plan | `qwen-plan/qwen3.7-plus` | `qwen-plan-qwen3-7-plus` | `qwen3.7-plus` |
+| GLM-5.3 Coding Plan | `zai-coding/glm-5.3` | `zai-coding-glm-5-3` | `glm-5.3` |
+| GLM-5.3 1M Coding Plan | `zai-coding/glm-5.3-1m` | `zai-coding-glm-5-3-1m` | `glm-5.3[1m]` |
 | GLM-5.2 Coding Plan | `zai-coding/glm-5.2` | `zai-coding-glm-5-2` | `glm-5.2` |
 | GLM-5-Turbo Coding Plan | `zai-coding/glm-5-turbo` | `zai-coding-glm-5-turbo` | `glm-5-turbo` |
+| GLM-5.3 Z.ai API | `zai-api/glm-5.3` | `zai-api-glm-5-3` | `glm-5.3` |
+| GLM-5.2 Z.ai API | `zai-api/glm-5.2` | `zai-api-glm-5-2` | `glm-5.2` |
+| GLM-4.7 Z.ai API | `zai-api/glm-4.7` | `zai-api-glm-4-7` | `glm-4.7` |
+| GLM-5.3 opencode Go | `opencode-go/glm-5.3` | `opencode-go-glm-5-3` | `glm-5.3` |
 
 The native catalog objects are preserved rather than reconstructed, which keeps
 current instructions and capability metadata from the installed Codex build.
@@ -214,13 +220,20 @@ The relay requires an active ChatGPT sign-in because only the native Codex
 backend can open its own opaque payload. In login-free mode the router fails
 closed instead of forwarding unreadable ciphertext to an external provider.
 
-Only registry-proven models are advertised as native v2 spawn-agent overrides
-by default. The Settings tab (desktop panel and macOS tray) exposes two local
-accordions: **Subagent models** controls whether all selected models, or only
-individually chosen models, are promoted to `multi_agent_version: "v2"` in the
-merged catalog. The all-models mode follows the picker dynamically: a model
-hidden from **Model picker** is not exposed as a subagent. Each accordion also
-has select-all and unselect-all bulk actions. `bin/multi-agent on` still
-promotes every picker-visible selected model, and `bin/multi-agent off`
-restores the conservative set. The checked-in provider registry is never
-changed by these switches.
+Only registry-proven models are advertised as native v2 spawn-agent overrides.
+The Settings tab (desktop panel and macOS tray) exposes two local accordions:
+**Subagent models** can withhold or re-enable proven models, while **Model
+picker** controls visibility. Local settings never promote an unverified model
+to `multi_agent_version: "v2"`; that capability requires the checked-in native
+collaboration proof. A model hidden from the picker is not exposed as a
+subagent. Each accordion also has select-all and unselect-all bulk actions.
+
+On Codex 0.147, a child's FINAL_ANSWER is recorded as `subAgentActivity`
+`interacted` and stays visually working for the whole live parent turn.
+`close_agent` is not in that v2 toolset. The managed `multi_agent_v2` block
+therefore also sets `usage_hint_enabled` and tells the root agent to call
+`interrupt_agent` on a finished child. Because long multi-agent parents
+still skip that call, the router additionally injects any missing
+`interrupt_agent` tool calls into the parent response when the request input
+already contains those children's FINAL_ANSWER messages. That is the only
+path that settles the badge without the user clicking into each child.

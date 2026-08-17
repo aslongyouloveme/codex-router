@@ -71,6 +71,7 @@ test("the snapshot joins installed, checked, loaded, and vision state", () => {
     running: ["qwen2.5vl:3b"],
     selection: { version: 1, enabled: ["gemma3:4b"] },
     benchmarks: { "gemma3:4b": { tier: "accurate", textPercent: 100 } },
+    runtime: { installed: true, running: true, version: "0.1.0" },
     // Supplied so the test never shells out to the machine's real Ollama.
     capabilities: {
       "gemma3:4b": ["completion", "vision"],
@@ -91,6 +92,7 @@ test("the snapshot joins installed, checked, loaded, and vision state", () => {
   assert.equal(byTag["gemma3:4b"].vision, true);
   // None of these can call tools, so none can be a Codex chat model.
   assert.equal(snapshot.usableAsChat, 0);
+  assert.deepEqual(snapshot.runtime, { installed: true, running: true, version: "0.1.0" });
 });
 
 test("removing a model needs explicit consent and unchecks it", () => {
@@ -472,6 +474,18 @@ test("the explore catalog groups the requested Ollama families and keeps fit vis
     "qwen3.5:35b-a3b-coding-nvfp4",
     "qwen3.6:27b",
     "qwen3.6:35b-a3b-mtp-q4_K_M",
+    "qwen3.8:latest",
+    "qwen3.8:27b",
+    "qwen3.8:27b-mlx",
+    "qwen3.8:27b-mlx-bf16",
+    "qwen3.8:27b-mtp-q4_K_M",
+    "qwen3.8:27b-mtp-q8_0",
+    "qwen3.8:27b-mtp-bf16",
+    "qwen3.8:27b-mxfp8",
+    "qwen3.8:27b-nvfp4",
+    "qwen3.8:27b-q4_K_M",
+    "qwen3.8:27b-q8_0",
+    "qwen3.8:27b-bf16",
     "nemotron-3-super:120b",
     "nemotron-3-super:120b-a12b-q8_0",
     "nemotron-3.5-lightning:latest",
@@ -494,8 +508,14 @@ test("the explore catalog groups the requested Ollama families and keeps fit vis
   ]) assert.ok(tags.has(tag), tag);
   assert.equal(entries.find((entry) => entry.tag === "nemotron-3-super:120b").fit, "too-large");
   assert.equal(entries.find((entry) => entry.tag === "gemma4:12b").tools, false);
-  assert.equal(EXPLORE_LOCAL_MODELS.length, 189);
-  assert.equal(new Set(EXPLORE_LOCAL_MODELS.map((entry) => entry.tag)).size, 189);
+  assert.equal(EXPLORE_LOCAL_MODELS.length, 201);
+  assert.equal(new Set(EXPLORE_LOCAL_MODELS.map((entry) => entry.tag)).size, 201);
+  // The qwen3.8 capture (2026-08-15): 12 official 27B tags, 256K context.
+  assert.equal(
+    entries.find((entry) => entry.tag === "qwen3.8:27b").researchStatus,
+    "Official Ollama · 12 tags",
+  );
+  assert.equal(entries.find((entry) => entry.tag === "qwen3.8:27b").context, 262144);
   const cloud = entries.find((entry) => entry.tag === "qwen3.5:cloud");
   assert.equal(cloud.downloadable, false);
   assert.equal(cloud.fit, "cloud-only");
@@ -517,6 +537,15 @@ test("the explore catalog groups the requested Ollama families and keeps fit vis
     entries.find((entry) => entry.tag === "nemotron-3.5-lightning:latest").researchStatus,
     "Official Ollama · 11 tags",
   );
+  assert.equal(
+    entries.find((entry) => entry.tag === "qwen3.8:latest").researchStatus,
+    "Official Ollama · 12 tags",
+  );
+  assert.deepEqual(
+    entries.find((entry) => entry.tag === "qwen3.8:latest").researchCapabilities,
+    ["vision", "tools", "thinking"],
+  );
+  assert.equal(entries.find((entry) => entry.tag === "qwen3.8:27b-mtp-q8_0").sizeGb, 30);
   assert.deepEqual(
     entries.find((entry) => entry.tag === "nemotron-3.5-lightning:latest").researchCapabilities,
     ["tools", "thinking"],
@@ -631,3 +660,4 @@ test("the listing says how little room Codex leaves in the window", () => {
   assert.match(rendered, new RegExp(`${Math.round(CODEX_PROMPT_TOKENS / 1000)}K of the 32K window`));
   assert.match(rendered, /agent-check/);
 });
+

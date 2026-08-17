@@ -1,5 +1,472 @@
 # Changelog
 
+## 0.4.0-beta.4
+
+- **A command that opens the browser panel.** The panel shipped with no way to
+  reach it: its URL carries the caller capability, and nothing printed one, so
+  "nothing to install" still meant "and no way in". `codex-router.ps1 panel`
+  (`bin/panel`) opens it in the default browser. It reports the router being
+  down instead of opening a page that would load empty, and prints the address
+  redacted, because AGENTS.md treats the capability path as local
+  authentication; `--print` is the deliberate exception and says what it is
+  handing over.
+
+- **Caller-key redaction covered only `/v1`.** `redactCallerUrl` is what keeps
+  the capability out of support bundles, doctor output, and error messages, and
+  it matched the API path alone -- so a panel URL, the identical secret in the
+  identical position, travelled through every one of those surfaces verbatim.
+  It now covers each leaf the capability guards.
+
+- **The companion no longer requires a Rust toolchain.** Building it meant
+  installing cargo, the heaviest prerequisite in the project, asked of someone
+  who only wanted to see the panel; without it the install step failed and the
+  machine ended up with no companion at all. `tray install` now falls back to
+  the Electron shell, which needs only the Node the router install already
+  required, and `codex-router.ps1 companion` selects it explicitly.
+  `scripts/build-electron-companion.ps1` and its shell counterpart verify the
+  runtime is actually present: npm 11 blocks install scripts by default and
+  electron downloads its runtime from one, so `npm ci` exits 0 having fetched
+  the package but not the binary, and the failure surfaces much later as an app
+  that never starts.
+
+- **Every single-argument Windows subcommand was unreachable.** PowerShell
+  enumerates a statement's output into an assignment, so
+  `$Arguments = if (...) { @(...) }` collapsed a one-element array to the
+  element itself; `$Arguments[0]` then indexed a String and returned its first
+  character. `codex-router.ps1 tray status` died on "Unknown tray action 's'",
+  as did start, stop, restart, and uninstall. The existing tests asserted the
+  script's text rather than running it, so none of them saw it.
+
+- **`bin/` scripts were not pinned to LF.** They are the same POSIX shell
+  scripts as `install.sh` without the extension, so `.gitattributes`' `*.sh`
+  rule never reached them and a Windows checkout with `core.autocrlf=true`
+  rewrote all 27 to CRLF, which `sh` fails on. The blobs were already LF, which
+  is why POSIX installs kept working and the damage stayed invisible.
+
+- **The companion opens in a browser, with nothing to install.** The router is
+  already an HTTP server on loopback with a capability-gated path, and the UI
+  is plain HTML whose entire backend surface is one function, so it now serves
+  itself at `/panel` behind the same caller capability every other local
+  endpoint uses. No binary, no toolchain, no packaging, no tray icon to find.
+  The panel deliberately carries only the reading half of the command table:
+  a browser tab is reachable by anything that learns the capability, and
+  "save this API key" is not something to expose on that assumption.
+
+- **An Electron shell, packaged.** `apps/electron` builds an installer through
+  electron-builder (NSIS and zip on Windows, AppImage on Linux). It is a shell
+  rather than a second application: `apps/desktop/ui` is loaded verbatim and
+  every command runs through the same table, so all three surfaces -- tray,
+  Electron, browser panel -- are windows onto one application. The command
+  table moved to `src/desktop-commands.mjs` for exactly that reason.
+
+- **The desktop companion is a download now, not a build.** It could be
+  obtained exactly one way -- install a Rust toolchain and compile it -- which
+  is a hard prerequisite for anyone who only wants to run it. CI was already
+  building the Windows and Linux binaries on every run and discarding them, and
+  releases shipped source archives only. Releases now attach
+  `codex-router-tray-<version>-windows-x64.exe` and the Linux binary,
+  checksummed in `SHA256SUMS` and covered by the same provenance attestation as
+  every other asset; CI publishes the same binaries as artifacts so unreleased
+  changes can be tried without a toolchain. Windows already ships the WebView2
+  runtime the companion needs, so a downloaded binary just runs.
+
+- **The Windows tray is managed the way the macOS one is.** Installing it was
+  possible but nothing else was: `bin/model-router-tray` answered Windows with
+  "use scripts/build-desktop-tray.ps1" and `codex-router.ps1` had no `tray`
+  verb at all, so where macOS and Linux each have one command that builds the
+  companion and hands it to a supervisor, Windows had two incantations and no
+  way to check, restart, or remove it. `./codex-router.ps1 tray
+  [install|status|start|stop|restart|uninstall]` is that command. Install
+  rebuilds only when the sources moved and stamps the build, so an update no
+  longer rebuilds a current companion from scratch — Windows was missing from
+  the rebuild gating entirely, which meant the one platform whose tray must be
+  built deliberately was also the one that never recorded having been built.
+  Guided setup now runs the same command instead of repeating its steps.
+
+- **`control apply` stopped carrying its own Windows installer invocation.** It
+  reuses the checkout-installer helper that `update` already uses and that is
+  unit tested, rather than a second hand-written PowerShell argument list that
+  nothing covered — the follow-up asked for in the review of #186.
+- **A credential-free install mode for lifecycle validation.** (#224)
+  `install.sh --no-provider --no-discovery` (PowerShell: `-NoProvider
+  -NoDiscovery`) installs the router idle: an explicit empty provider
+  selection, no credential prompts, and a persisted discovery kill-switch
+  honored by every credential reader — provider key files, the macOS
+  Keychain, other CLIs' OAuth and session files, Codex's `auth.json`, and the
+  `codex login status` probe all stay untouched. Codex traffic gets a local
+  `503 router_idle_no_provider` instead of provider or native forwarding, the
+  doctor reports the idle state at warn and exits 0, and a new `stop`
+  subcommand completes the install → start → status → doctor → stop →
+  uninstall loop. Re-running setup without the flags leaves idle mode. As
+  part of this, an explicitly empty provider selection now passes
+  `ensure-configured` as idle, which also un-breaks `bin/update` for anyone
+  who had hidden their last provider by hand.
+- **Uninstalling the last client integration now removes the background
+  service.** Whether Codex still counted as installed was keyed on the cached
+  native catalog, a file uninstall deliberately retains — so the service, its
+  LaunchAgent, and its listening ports survived every codex uninstall. The
+  installed-state witness is now the managed block in `config.toml`, which
+  enable writes and disable removes; `bin/disable` of the last client retires
+  the service too, matching what the Windows wrapper always did, and
+  `bin/enable` reinstalls it on the way back.
+
+- **Switching a model on as a subagent now researches it instead of ignoring
+  it.** Only six registry-proven models could ever be spawned as native v2
+  children; everything else the operator enabled was a silent no-show, and
+  promoting one more meant a repository change per model per provider. Now the
+  toggle is the assignment: enabling a model hands it to a detached capability
+  probe (two live requests proving streaming and a forced tool call through
+  the installed router), a passing model is advertised to Codex as an
+  experimental subagent, and the first real child turn settles the verdict —
+  the router watches its own request path for `x-openai-subagent` turns, and a
+  clean completion records a durable machine-local proof while a structural
+  rejection demotes the model back to v1 with the reason kept in the subagent
+  snapshot. Evidence lives in the protected `multi-agent-proofs.json`; local
+  settings still cannot manufacture a v2 claim, hidden or switched-off models
+  stay v1 whatever evidence they carry, and `control subagents verify` re-runs
+  the research explicitly.
+
+- **A reasoning model no longer answers into thirty seconds of silence.** The
+  empty-completion guard buffered every routed streaming response until it saw
+  content, and reasoning deltas deliberately did not count as content. On a
+  reasoning model the gap between the first reasoning delta and the first output
+  token is seconds to minutes, so the guard held that entire gap and the caller
+  saw nothing until the turn closed or the hold budget expired. Measured against
+  `opencode-go/deepseek-v4-pro` with only this behaviour varying, the client's
+  first byte moved from 30,638 ms to 517 ms; `deepseek-v4-flash` moved from
+  29,409 ms to 536 ms. Both held runs parked at the 30-second budget, which is
+  to say the budget decided when the caller saw anything, not the model.
+
+  Throughput was never affected, which is why this read as a frozen turn rather
+  than a slow one — and why no metric caught it. `responseStartMs` stops at
+  the response headers and `firstTokenMs` fires on reasoning deltas, and the
+  guard kept holding past both.
+
+  The hold exists only to make the retry invisible, and the recorded meter
+  prices it: across 19,043 routed turns it fired 168 retries, of which 17
+  succeeded. Every reasoning turn paid up to thirty seconds of dead air for a
+  silent rescue on roughly one routed turn in a thousand. So reasoning now ends
+  the hold without settling the verdict — the stream is relayed and the guard
+  keeps watching from behind it, and a turn that reasons and then produces
+  nothing is still classified empty. A silent upstream has no prologue worth
+  waiting for, so that case still holds every byte and still retries silently.
+
+- **An empty turn that already reached the client is stated, not swallowed.**
+  Once the prologue is on the wire the router cannot substitute a retry for it,
+  so it writes an `error` event into the open stream instead of grafting a
+  second response onto one the client is already reading. Codex treats that as
+  retryable and reissues the turn on its own ladder, which recovers more than
+  the single silent retry it replaces — verified against `codex-cli` 0.145.0
+  with a stub upstream: a reasoning turn ending in an empty completion produced
+  one request, no answer and no error, while the same turn ending in an `error`
+  event produced two requests and an answer. Turns that end this way are
+  metered as `emptyCompletionUnrepairable`, apart from the retried ones, because
+  one is a failure the router absorbed and the other is one the user sees.
+
+- **Finished subagents close without a click, even when the parent ignores the
+  usage hint.** Codex 0.147 still maps a child's `FINAL_ANSWER` to Working for
+  the live parent turn, and long San Francisco multi-agent parents often never
+  call `interrupt_agent` despite the managed `root_agent_usage_hint_text`. The
+  router now scans the request input for unfinished `FINAL_ANSWER` children and
+  injects the missing `collaboration.interrupt_agent` calls into the parent
+  response (stream and non-stream) before `response.completed`. This runs on
+  both routed external models and native OpenAI multi-agent parents (the SF
+  build path). Model-authored interrupts are left alone; only missing closes
+  are added.
+
+- **Finished subagents no longer stay Working just because the parent turn is
+  still live.** Codex 0.147 records a child's `FINAL_ANSWER` as
+  `subAgentActivity` `interacted` and maps that to Working until the parent
+  turn ends, the user clicks into the child, or the parent calls
+  `interrupt_agent`. `close_agent` is not in that v2 toolset. The managed
+  `multi_agent_v2` block now ships a root usage hint that tells the parent to
+  interrupt finished children, so new tasks settle the badge without a click.
+
+- **GLM-5.3, on every route that actually serves it.** Z.ai shipped GLM-5.3 on
+  2026-08-14. It is now in the picker three ways: `zai-coding/glm-5.3` on the
+  GLM Coding Plan subscription, `zai-api/glm-5.3` on the metered platform, and
+  `opencode-go/glm-5.3` on the opencode Go subscription, whose catalog already
+  advertises it (`./bin/discover-models opencode-go`). Command Code, Qwen Plan,
+  Ollama Cloud, and ClinePass do not carry it yet, so nothing was added there.
+
+  Z.ai documents the 1M context window for GLM-5.3 only behind the `[1m]` model
+  suffix, so that is a separate entry — `zai-coding/glm-5.3-1m`, which sends
+  `glm-5.3[1m]` and a one-million-token compaction window. The suffix-free
+  entries stay at the 200K lineage default rather than inheriting GLM-5.2's 1M,
+  because under-declaring a context window compacts early and over-declaring
+  overruns the turn.
+
+- **A Z.ai key now means one of two different things, and the router keeps them
+  apart.** `zai-api` is a new provider for the metered open platform on
+  `https://api.z.ai/api/paas/v4`, carrying GLM-5.3, GLM-5.2 (1M context), and
+  the cheaper GLM-4.7. It ships GLM-5.3 and GLM-5.2 with the same reasoning
+  ladders as the plan route, and GLM-4.7 with none, because Z.ai documents no
+  effort control for it.
+
+  It is a separate credential end to end: its own key file
+  (`zai-api-key.secret`), its own keychain service, and its own environment
+  variable (`ZAI_PLATFORM_API_KEY`) — never the plan's `ZAI_API_KEY`. A Coding
+  Plan key is not billable on the metered endpoint and vice versa, so a
+  `planNote` says so wherever a key is connected, and the account panel links
+  the billing page instead of polling the plan quota route with a key that has
+  no plan behind it.
+
+- **GLM reasoning effort follows the model, not the vendor.** The `glm-thinking`
+  request profile mapped every multi-tier GLM onto GLM-5.2's two rungs
+  (high/max), which would have silently rounded GLM-5.3's new `low` tier up to
+  `high` and billed deeper thinking than was asked for. The requested effort is
+  now clamped onto the ladder each model's own registry entry declares.
+
+- **DeepSeek Harness can use the Codex models you are already signed in to.**
+  Native GPT traffic is authorized by the caller's own ChatGPT session — the
+  router copies `authorization` and `chatgpt-account-id` off each request, Codex
+  attaches both, and a harness turn attaches neither. So the eight native models
+  were withheld from the harness: advertising them would have offered a turn
+  that could not authenticate.
+
+  The router now falls back to the session this machine is already signed in
+  with. You are logged in to Codex here; a client running as the same user on
+  the same machine should not have to log in again. The eight `gpt-5.6-*` and
+  `gpt-5.x` models publish to the harness whenever that session is usable, and
+  are withheld the moment it is not, so the picker never offers a model that
+  would 401.
+
+  It is a fallback and never an override: the injection happens only for a
+  request that carried no credential of its own, so a Codex turn is unchanged —
+  verified by relaying a deliberately invalid token and getting that token's own
+  401 back instead of a success. The credential is never logged, never returned
+  by a status call, and never put in an error message.
+
+  The session is checked for life, not just presence. That access token lasts
+  about ten days and Codex renews it only when Codex is used, so a harness-only
+  stretch longer than that would have left the router sending a dead token. An
+  expired session is declined two minutes early, native models stop being
+  published while it is dead, and `doctor` gains a line saying to open Codex
+  once — which is the fix, and which nothing else would have told anybody.
+  Renewal is left to Codex: reproducing that OAuth exchange would mean guessing
+  an unpublished client identity and risking the very login this was asked not
+  to disturb.
+
+  Worth knowing before leaving it on: it widens what the caller key reaches,
+  from the API-key providers to the ChatGPT subscription as well.
+  `CODEX_ROUTER_NATIVE_SESSION_FALLBACK=0` turns it off, and the harness drops
+  back to routed models only.
+
+- **The tray can install DeepSeek Harness, not just publish into one.**
+  `--target dsh` wrote routed models into a harness the user had already
+  installed themselves; on a machine without one, the missing step was an
+  `npm install -g` mentioned in passing in the docs. A Settings row now installs
+  `@deepseek-ai/dsh` and publishes in one click, and `control harness
+  status|setup` does the same from a terminal.
+
+  Global rather than the `npx @deepseek-ai/dsh web` the harness's README
+  documents: npx refetches on every run, leaves no `dsh` to type again, and is
+  invisible to the presence rule that keeps the router up for clients it cannot
+  watch. Node is checked against the harness's floor before npm is reached,
+  since the package declares no `engines` and a stale runtime otherwise fails at
+  first boot with a syntax error from inside `node_modules`. Install and publish
+  are ordered but not transactional — a failed publish leaves an installed
+  harness, which is where a retry wants to start, and republishing is
+  byte-identical. The npm mechanics move to `src/npm-global-install.mjs`, shared
+  with the provider-CLI installs rather than copied.
+
+  It is never a side effect: no `apply`, `enable`, or repair path installs the
+  harness. The model count the button reports is the routable set, not the
+  picker — native GPT models come and go with the Codex session described
+  above.
+
+  The row then runs the harness's browser UI: **Install**, then **Connect**,
+  then a play button, then **Open site**, each shown only in the state it
+  applies to. Publishing models and leaving somebody to remember a command and a
+  port was the step this action existed to remove, so the play button starts the
+  UI and the row reports the URL it is serving. Setup itself deliberately does
+  not start anything — it already installs a package and writes another
+  program's configuration, and a republish should not put a browser window on
+  screen nobody asked for.
+
+  A running server this router did not start is adopted rather than collided
+  with — the harness binds a fixed port, so a second launch exits with
+  `EADDRINUSE` — and only a process this router started is ever signalled,
+  matched on PID *and* process start identity because PIDs are reused.
+
+  It can also be turned off again, which it could not safely be before.
+  `bin/model-router dsh disable` ran `service.mjs uninstall` unconditionally, so
+  switching the harness off removed the LaunchAgent and stopped Codex working
+  too — the service is one shared plane, and one client leaving is not a reason
+  to retire it. `bin/disable` now removes it only once no client integration
+  remains, and the tray's **Turn off** goes through `control harness disconnect`,
+  which stops a UI this router started, removes the route, and touches nothing
+  else: the CLI, the harness's own settings, its other providers, and the
+  service all stay.
+
+  Two ways the uninstall could damage a user's own configuration are fixed with
+  it. Restoring the default model overwrote whatever was there with the snapshot
+  taken at install — so a model chosen afterwards through the harness's own
+  Models page was silently discarded; the restore now applies only over a
+  default this router wrote. And with no snapshot left to restore, a
+  router-owned default was left in place pointing at the provider the same
+  uninstall had just removed; it is now taken out.
+
+
+- **A client the tray cannot watch keeps the router running.** The tray's
+  presence setting could tie the router to the Codex and ChatGPT desktop apps
+  and stop it 30 seconds after both closed. `NSRunningApplication` enumerates
+  app bundles and nothing else, so that setting could only ever see those two:
+  a `codex` TUI in a terminal and a `dsh` harness turn are both invisible to it.
+  Neither can be started on demand either — a turn that finds 127.0.0.1:4202
+  closed fails at once, while the stack behind that port takes up to 300 seconds
+  to warm — so a terminal user who tried the setting got a dead port and a
+  `doctor` line telling them to open an app they may not use.
+
+  `effectivePresenceMode()` now reports `always` whenever the harness route is
+  published or `codex` resolves on PATH, and the tray and `doctor` both act on
+  that instead of the raw mode. Detection errs toward finding a client: a false
+  positive costs a dormant toggle, a false negative costs somebody their next
+  request. The stored preference is overridden rather than rewritten, so
+  removing the client restores the user's own choice. `control --json` now
+  carries a `presence` block so the router owns the rule and the tray consumes
+  it rather than re-deriving it, and the tray picks up a change on the snapshot
+  it already polls.
+
+- **DeepSeek Harness is a supported target.** `--target dsh` publishes every
+  routed model into the harness's own `settings.yaml` as one provider route,
+  keyed to the same `/v1/responses` endpoint Codex already uses — so a harness
+  turn gets the router's tool-result ageing, vision bridge, prompt-token
+  substitution, bounded upstream retries, and tokens-per-second accounting
+  without a second request path. The harness's shipped bundle mounts
+  `dsh-llm-pi-ai` dormant and hot-reloads its settings document, so this is a
+  settings write rather than a plugin change and there is nothing to restart.
+  A target is a *client*, not a router: both share one service, one gateway,
+  one credential store, and one provider selection, so adding the second
+  integration never asks for a key again, and any change to the routable set
+  republishes whichever clients are installed rather than letting the two
+  drift apart.
+
+  The router owns exactly one key in each of the harness's two documents
+  (`llm-pi-ai.providers.codex-router` and `CODEX_ROUTER_CALLER_KEY`) and treats
+  every other byte as somebody else's: sibling routes, other sections,
+  comments, and other credentials survive a publish, and `dsh disable` restores
+  the document. A settings file the new fail-closed YAML lexer cannot read
+  unambiguously — a tab indent, a duplicate key, a multi-document stream, an
+  inline `providers` mapping — is refused with the file untouched and the line
+  named, rather than rewritten on a guess. Both documents are written 0600, the
+  same bound the harness holds them to, because the settings document carries
+  the managed base URL and the other carries the key it references.
+
+  Only selected, credentialed, listed, non-hidden routed models are published.
+  Native GPT models are not: they need the caller's own ChatGPT session, which
+  a harness request does not carry, so advertising them would offer a turn that
+  cannot authenticate — the same reason the vision-bridge engine candidates
+  exclude them here. Taking over the harness's default model is opt-in,
+  snapshotted, and reversible; delegation stays the user's, since
+  `dsh-tool-subagent` is composition rather than settings and
+  `./bin/model-router dsh subagent-preset` hands over the block to paste
+  instead of editing a preset the router does not own.
+
+- **`src/skills-install.mjs` no longer hijacks an unrelated `install`.** Its
+  CLI block ran on `process.argv[2]` alone with no entry-module guard, and
+  `install-manifest.mjs` imports it — so any command that transitively pulled
+  the manifest in while its own subcommand happened to be `install` or
+  `uninstall` installed the Codex skill pack and exited 0 before doing its own
+  work. Every other module in the repository already guarded this; this one
+  now does too.
+
+- **Command Code's catalog caught up, and one dead route fixed.** The Messages
+  route advertised Haiku 4.5 as `claude-haiku-4-5`, the undated alias every
+  other Anthropic surface accepts. Command Code's catalog does not carry it —
+  only the dated `claude-haiku-4-5-20251001` — so that route could never have
+  resolved, and it was the one registered id in either reseller family absent
+  from the live `/models` list. A registry assertion now pins the dated id.
+
+  Fourteen models Command Code serves and the registry did not are now checked
+  in: `grok-4.6`, `claude-opus-5`, `gpt-5.6-sol`, `gpt-5.6-terra`,
+  `gemini-3.7-flash`, `GLM-5.2-Fast`, `Kimi-K2.7-Code-Highspeed`,
+  `Qwen3.7-Flash`, and first entries for five vendors the reseller added since
+  the last sweep — `meta/muse-spark-1.2`, `nvidia/nemotron-3-ultra`,
+  `sakana/fugu-ultra`, `thinkingmachines/inkling` and `inkling-small`, and
+  `poolside/laguna-s-2.1`. Context windows come from Command Code's own
+  `/models` payload rather than the model name; effort ladders, image support,
+  and request profiles mirror the already shipped sibling of the same upstream
+  line, or fall back to the conservative single-`high` floor for a vendor with
+  no prior entry. Older point releases the catalog still lists behind a
+  registered newer sibling (GLM-5/5.1, Kimi K2.5/K2.6, MiniMax-M2.5,
+  Qwen3.6, Step-3.5, gemini-3.1/3.5-flash-lite, gpt-5.3/5.4, mimo-v2.5) stay
+  out deliberately; `bin/curate-models commandcode` still reaches them per
+  user.
+
+  These fourteen route correctly — a live request reaches Command Code and
+  comes back with the account's own plan verdict — but their capability
+  metadata is **not** live-verified: the test account is on the Go plan, which
+  answers every Provider API call with "Your Go plan doesn't include API
+  access." That blocks the tool-calling, streaming, and compaction probes for
+  the twenty-one models already shipped just as much as for the new ones. Run
+  `./bin/test-model 'commandcode/SLUG' --live --yes` on a Provider-plan account
+  before treating any of them as proven.
+
+  opencode Go needed no additions. All seven ids its catalog lists and the
+  registry omits (`glm-5`, `kimi-k2.5`, `minimax-m2.5`, `qwen3.5-plus`,
+  `mimo-v2-pro`, `mimo-v2-omni`, `hy3-preview`) are older releases or preview
+  channels of models already registered, and every registered opencode Go id
+  is still live.
+
+- **Windows installs the tray companion, and keeps it.** Nothing on Windows
+  ever built or started it: `install.ps1` had no tray option at all, the
+  installer's own decision helper excluded the platform outright, and
+  `control tray enable` answered `{"supported":false}` and exited 0 — a silent
+  no-op that reads as success while no tray was ever going to appear. The only
+  route was knowing to run `scripts/build-desktop-tray.ps1` by hand, and even
+  then the companion vanished at the next reboot. `install.ps1 -WithTray` (and
+  `-NoTray`, matching `install.sh`) now builds it and registers a `Codex Router
+  Tray` logon task, kept separate from the router's own task so stopping one
+  never takes the other down. Quitting from the tray menu stays quit: the
+  restart setting covers a crash, not a clean exit. A platform with no
+  supervisor now says so on stderr rather than reporting success, and the
+  guidance names the `^` overflow that hides new tray icons on Windows 11.
+
+- **Windows stops mistaking its own spawn failures for provider problems.** A
+  command resolved on Windows and a command Windows can spawn are two different
+  things: `where.exe` lists the extensionless npm shim first, and Node has
+  refused to run a `.cmd` shim without a shell since CVE-2024-27980. Four
+  copies of the same lookup helper took line one anyway, and the spawn errors
+  that followed were each read as something else. The official Grok CLI was the
+  worst of it — a healthy npm install failed to launch, raising the same
+  `spawn UNKNOWN` that Smart App Control raises, so the router announced that
+  Windows application control had blocked it and told the operator to give up
+  on OAuth and use an API key. Even had the preflight passed, the token refresh
+  behind it spawned the shim the same unusable way.
+
+  Resolution and launching now live in one module and are used everywhere:
+  the routed-subagent proof run (which hands Codex a whole sentence, so it
+  cannot go through a shell that joins arguments on spaces), the Codex account
+  usage panel, the doctor's Codex configuration probe, the `npm install -g` and
+  sign-in paths for provider CLIs, and the precedence probe. Arguments are
+  escaped for `cmd.exe` rather than concatenated, so a path under
+  `C:\Program Files` and a prompt containing spaces both survive.
+
+- **Three more Windows-only breakages in the same family.** The Codex account
+  usage panel kept a private two-line search for the CLI — an undocumented
+  environment variable, a macOS-only path, then the bare name — which finds
+  nothing on Windows, so the panel reported "the Codex app-server could not be
+  started" on every machine; it now uses the shared discovery and kills the
+  process tree rather than leaking a Codex process per poll. `control apply`
+  ran the POSIX `bin/enable` script, which Windows cannot execute, and now
+  takes the PowerShell installer that `doctor --fix` already uses. The
+  vision-model download worker was the one detached child without
+  `windowsHide`, so it opened a console window for the length of a
+  multi-gigabyte pull.
+
+- **A local Ollama the router could find is one it can also run.** The vision
+  host probed for Ollama through the runtime's known install locations but then
+  spawned the bare name, so a Windows install under `%LOCALAPPDATA%` reported
+  as available and failed at the next call. Both now use the same resolver.
+
+- **Routed models that emit integer tool arguments as JSON floats no longer
+  get those calls rejected by Codex.** Grok 4.6 was sending
+  `timeout_ms: 20000.0`; Codex's native `shell_command` schema wants a `u64`,
+  so every agentic turn died before the command ran. The response rewrite now
+  turns whole-number tokens into integers on the way back, including native
+  tools that are not namespaced. Genuine fractions are left alone.
+
 ## 0.4.0-beta.3
 
 - **The usage panel shows what is left of your plan for xAI OAuth, MiniMax,

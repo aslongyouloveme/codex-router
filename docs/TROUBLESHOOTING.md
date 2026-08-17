@@ -117,8 +117,14 @@ On Windows, first confirm that the installed official CLI can launch:
 grok --version
 ```
 
-If that command reports `spawn UNKNOWN`, "An Application Control policy has
-blocked this file," or a Smart App Control notification, Grok OAuth cannot
+If `grok --version` works in a terminal but the doctor still reports the CLI as
+blocked, upgrade first: releases before this fix picked the extensionless npm
+shim out of `where.exe grok` and could not spawn it, and that failure raises the
+same `spawn UNKNOWN` Windows application control does. The router now selects
+the `grok.cmd` shim and launches it through `cmd.exe`.
+
+If the command itself reports `spawn UNKNOWN`, "An Application Control policy
+has blocked this file," or a Smart App Control notification, Grok OAuth cannot
 complete login or refresh its session. Keep Smart App Control enabled; it does
 not offer a safe per-app bypass for this failure. Until xAI publishes an
 official CLI build that Windows allows, use the API-key provider instead:
@@ -157,7 +163,10 @@ do not share credentials or billing. Alibaba plan keys (`sk-sp-` prefix) are
 separate from pay-as-you-go Model Studio keys and only work with the plan's
 dedicated base URL. The Z.ai coding key is also distinct from general Z.ai
 platform keys; only the Coding Plan subscription key works with the coding
-endpoint.
+endpoint. The two live side by side as separate providers: `zai-coding` reads
+`ZAI_API_KEY` / `ZAI_CODING_API_KEY` for the plan, and `zai-api` reads
+`ZAI_PLATFORM_API_KEY` for pay-per-token traffic. A 401 on one route usually
+means the other route's key was stored.
 
 ## A provider changed its model IDs
 
@@ -218,6 +227,35 @@ grep -c estimatedInputTokens "$CODEX_HOME/codex-router/usage-events.jsonl"
 Report zero-token responses to the provider; only they can fix the source. To
 see the provider's own numbers in Codex again, set
 `CODEX_ROUTER_ZERO_INPUT_ESTIMATE=0` in the service environment.
+
+## Finished subagents stay Working
+
+Codex 0.147 keeps a child visually working after it has already written
+`FINAL_ANSWER` if the parent turn is still live. Opening the child flips it
+to done because that loads the child's idle thread status. `close_agent` is
+not in the v2 toolset; `interrupt_agent` is the close path that build
+exposes.
+
+The router now does two things:
+
+1. Ships a managed `multi_agent_v2` usage hint so the parent is told to call
+   `interrupt_agent` on finished children.
+2. On routed parent turns, scans the request for unfinished `FINAL_ANSWER`
+   children and injects any missing `interrupt_agent` calls into the response
+   before it completes. That is what settles San Francisco multi-agent badges
+   when the parent otherwise keeps working.
+
+Restart the router service so the inject path is loaded, then start a new
+parent turn (or nudge the stuck parent so it issues another request):
+
+```sh
+./bin/model-router codex doctor --fix
+```
+
+Already-stuck badges in an old San Francisco turn settle on the next parent
+response (native or routed) that sees those children's `FINAL_ANSWER` in
+input. If the parent is fully idle and never turns again, click into each
+child once or send a short follow-up on the parent.
 
 ## The agent stops mid-task with no error
 

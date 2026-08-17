@@ -16,6 +16,7 @@ import {
   MODEL_BY_GATEWAY_ID,
   PROVIDERS,
   providerForModel,
+  resolveProviderBaseUrl,
 } from "./model-registry.mjs";
 import { parseRateLimitHeaders } from "./rate-limit-headers.mjs";
 import { recordRateLimitSnapshot } from "./rate-limit-state.mjs";
@@ -31,6 +32,9 @@ import {
   githubCopilotRequestHeaders,
 } from "./github-copilot-session.mjs";
 import { VERSION } from "./version.mjs";
+import { installStableFetchTransport } from "./fetch-transport.mjs";
+
+installStableFetchTransport();
 
 const LISTEN_HOST =
   process.env.MODEL_ROUTER_API_HOST ||
@@ -57,8 +61,19 @@ const QUIET =
 
 if (!INTERNAL_KEY) throw new Error("MODEL_ROUTER_INTERNAL_KEY is required.");
 
+// One line per provider per process: the refusal repeats on every request,
+// and the point is that the operator learns about it, not that the log fills.
+const warnedBaseUrlOverrides = new Set();
+
 function providerBaseUrl(provider) {
-  return String(process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  const { baseUrl, refusedOverride } = resolveProviderBaseUrl(provider);
+  if (refusedOverride && !warnedBaseUrlOverrides.has(provider.id)) {
+    warnedBaseUrlOverrides.add(provider.id);
+    console.error(
+      `[api-forwarder] ${provider.baseUrlEnv} ignored: keyless provider ${provider.id} sends no credential, so it stays on its loopback endpoint`,
+    );
+  }
+  return baseUrl;
 }
 
 // DeepSeek documents low/high/max (docs also accept xhigh as a compat alias).
@@ -89,6 +104,29 @@ function ollamaCloudEffort(value) {
   if (value === "medium") return "medium";
   if (["xhigh", "max", "ultra"].includes(value)) return "max";
   return "high";
+}
+
+// Z.ai documents reasoning_effort per model, not per vendor: GLM-5.2 answers
+// to high/max, and GLM-5.3 adds a low tier (low/high/max, max the upstream
+// default). So the accepted rungs travel with the model, and the requested
+// effort is clamped onto the ladder its own registry entry declares instead of
+// onto a fixed two-tier map -- otherwise GLM-5.3's low tier could never be
+// reached. Codex's top rungs always mean "as deep as this model goes"; anything
+// else takes the nearest declared rung at or below it, and a request under the
+// model's floor lands on that floor. An absent or unknown value is treated as
+// "high", which is what the two-tier map sent before this generalization.
+const GLM_EFFORT_LADDER = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+function glmEffort(value, levels) {
+  const declared = levels
+    .filter((effort) => GLM_EFFORT_LADDER.includes(effort))
+    .sort((left, right) => GLM_EFFORT_LADDER.indexOf(left) - GLM_EFFORT_LADDER.indexOf(right));
+  if (!declared.length) return undefined;
+  if (["xhigh", "max", "ultra"].includes(value)) return declared.at(-1);
+  const requested = GLM_EFFORT_LADDER.indexOf(value);
+  const ceiling = requested === -1 ? GLM_EFFORT_LADDER.indexOf("high") : requested;
+  const atOrBelow = declared.filter((effort) => GLM_EFFORT_LADDER.indexOf(effort) <= ceiling);
+  return atOrBelow.at(-1) || declared[0];
 }
 
 // Strict chat-completions providers (e.g. MiniMax) reject a turn whose tool
@@ -406,13 +444,26 @@ function normalizeBody(buffer, contentType, route) {
   } else if (model.requestProfile === "deepseek-nonthinking") {
     payload.thinking = { type: "disabled" };
     delete payload.reasoning_effort;
-  } else if (model.requestProfile === "deepseek-force-max") {
+  } else if (
+    model.requestProfile === "deepseek-force-max" ||
+    model.requestProfile === "deepseek-force-max-auto-tool-choice"
+  ) {
     // Command Code and opencode Go DeepSeek V4 flash/pro are pinned to the
     // model's max reasoning tier on every request. The picker keeps its
     // normal levels and the operator selects "high", but the upstream always
     // sees max. LiteLLM can drop the inbound field entirely, so never depend
     // on the caller-supplied value.
     payload.reasoning_effort = "max";
+    // opencode Go DeepSeek models reject a forced tool choice; beta.4 fixed
+    // that with its own profile, so the combined profile keeps both fixes:
+    // force max reasoning and downgrade any forced tool_choice to "auto".
+    if (
+      model.requestProfile === "deepseek-force-max-auto-tool-choice" &&
+      payload.tool_choice !== undefined &&
+      payload.tool_choice !== "none"
+    ) {
+      payload.tool_choice = "auto";
+    }
   } else if (
     ["ollama-cloud", "ollama-cloud-auto-tool-choice"].includes(model.requestProfile)
   ) {
@@ -453,14 +504,14 @@ function normalizeBody(buffer, contentType, route) {
     }
   } else if (model.requestProfile === "glm-thinking") {
     payload.thinking = { type: "enabled" };
-    // Z.ai documents reasoning_effort only for GLM-5.2, with two effective
-    // tiers (high/max) and max as the upstream default when omitted. Models
-    // whose registry entry offers a single level (GLM-5-Turbo, GLM-5.1) do
-    // not support the parameter at all.
-    if ((model.reasoningLevels || []).length > 1) {
-      payload.reasoning_effort = ["xhigh", "max", "ultra"].includes(payload.reasoning_effort)
-        ? "max"
-        : "high";
+    // Each GLM entry declares exactly the tiers Z.ai documents for it, and the
+    // requested effort is clamped onto them. Models whose registry entry offers
+    // a single level (GLM-5-Turbo, GLM-4.7) do not support the parameter at
+    // all. Read the count off the entry rather than naming models here: this
+    // list is what goes stale when a route is added.
+    const levels = (model.reasoningLevels || []).map((level) => level.effort);
+    if (levels.length > 1) {
+      payload.reasoning_effort = glmEffort(payload.reasoning_effort, levels);
     } else {
       delete payload.reasoning_effort;
     }
@@ -540,7 +591,10 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
     }
     if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
   }
-  if (provider.protocol === "anthropic") {
+  if (provider.authMode === "anonymous") {
+    // The upstream explicitly permits anonymous access for the provider's
+    // free-model subset. Never forward the gateway's internal bearer token.
+  } else if (provider.protocol === "anthropic") {
     headers["x-api-key"] = apiKey;
     headers["anthropic-version"] ||= "2023-06-01";
   } else {
@@ -549,7 +603,9 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
   headers["User-Agent"] = `codex-router/${VERSION}`;
   headers["Accept-Encoding"] = "identity";
   Object.assign(headers, extraHeaders);
-  if (body.length) headers["Content-Length"] = String(Buffer.byteLength(body));
+  // Content-Length is fetch's to compute. An explicit copy is at best
+  // redundant, and the HTTP/1.1 dispatcher rejects the request outright
+  // (UND_ERR_INVALID_ARG) when a caller-supplied value accompanies a body.
   return headers;
 }
 

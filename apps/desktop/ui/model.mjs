@@ -1,3 +1,5 @@
+import { getLocale, t } from "./i18n.mjs";
+
 const DAY_MS = 24 * 60 * 60 * 1_000;
 
 export function clampPercent(value) {
@@ -8,13 +10,13 @@ export function clampPercent(value) {
 
 export function compactTokens(value) {
   const tokens = Math.max(0, Number(value) || 0);
-  if (tokens < 1_000) return Math.round(tokens).toLocaleString("en-US");
+  if (tokens < 1_000) return Math.round(tokens).toLocaleString(getLocale());
   if (tokens < 1_000_000) return `${trimFixed(tokens / 1_000, tokens < 10_000 ? 1 : 0)}k`;
   return `${trimFixed(tokens / 1_000_000, tokens < 10_000_000 ? 1 : 0)}m`;
 }
 
 export function exactTokens(value) {
-  return Math.max(0, Math.round(Number(value) || 0)).toLocaleString("en-US");
+  return Math.max(0, Math.round(Number(value) || 0)).toLocaleString(getLocale());
 }
 
 export function localDateKey(date) {
@@ -34,8 +36,8 @@ export function dailySeries(buckets = [], days = 7, today = new Date()) {
     const key = localDateKey(date);
     return {
       key,
-      label: new Intl.DateTimeFormat("en-US", { weekday: "short" }).format(date),
-      longLabel: new Intl.DateTimeFormat("en-US", {
+      label: new Intl.DateTimeFormat(getLocale(), { weekday: "short" }).format(date),
+      longLabel: new Intl.DateTimeFormat(getLocale(), {
         month: "short",
         day: "numeric",
       }).format(date),
@@ -71,10 +73,13 @@ export function quotaWindow(metric = {}) {
     label.includes("five-hour") ||
     minutes === 300
   ) {
-    return { key: "five-hour", label: "5-hour limit" };
+    return { key: "five-hour", label: t("usage.fiveHourLimit") };
   }
   if (label.includes("week") || minutes === 10_080) {
-    return { key: "weekly", label: "Weekly limit" };
+    return { key: "weekly", label: t("usage.weeklyLimit") };
+  }
+  if (label.includes("month") || minutes === 43_200) {
+    return { key: "monthly", label: t("usage.monthlyLimit") };
   }
   return null;
 }
@@ -87,6 +92,17 @@ export function metricPercent(metric = {}) {
   return Number.isFinite(used) && Number.isFinite(limit) && limit > 0
     ? clampPercent((used / limit) * 100)
     : null;
+}
+
+// Quota data is normalized internally as percentage used, but the tray's
+// allowance surfaces should answer the operator's question: how much is left.
+// Prefer an explicitly reported remaining value, then derive it from the
+// provider's used counters or percentage.
+export function metricRemainingPercent(metric = {}) {
+  const direct = clampPercent(metric.remainingPercent);
+  if (direct !== null) return direct;
+  const used = metricPercent(metric);
+  return used === null ? null : 100 - used;
 }
 
 export function buildQuotaCards({ account, providerUsage, providerSetup } = {}) {
@@ -107,6 +123,7 @@ export function buildQuotaCards({ account, providerUsage, providerSetup } = {}) 
       window: window.key,
       label: window.label,
       usedPercent: metricPercent(metric),
+      remainingPercent: metricRemainingPercent(metric),
       resetAt: Number(metric.resetsAt ?? metric.resetAt) || null,
     });
   };
@@ -156,23 +173,23 @@ export function sourceOptions({ account, providerUsage, providerSetup } = {}) {
 }
 
 export function formatReset(unixSeconds, now = new Date()) {
-  if (!Number.isFinite(Number(unixSeconds)) || Number(unixSeconds) <= 0) return "Reset time unavailable";
+  if (!Number.isFinite(Number(unixSeconds)) || Number(unixSeconds) <= 0) return t("usage.resetUnavailable");
   const date = new Date(Number(unixSeconds) * 1_000);
   const sameDay = localDateKey(date) === localDateKey(now);
   const tomorrow = localDateKey(date) === localDateKey(new Date(now.getTime() + DAY_MS));
-  const time = new Intl.DateTimeFormat("en-US", {
+  const time = new Intl.DateTimeFormat(getLocale(), {
     hour: "numeric",
     minute: "2-digit",
   }).format(date);
-  if (sameDay) return `Resets today at ${time}`;
-  if (tomorrow) return `Resets tomorrow at ${time}`;
-  return `Resets ${new Intl.DateTimeFormat("en-US", {
+  if (sameDay) return t("usage.resetsToday", { time });
+  if (tomorrow) return t("usage.resetsTomorrow", { time });
+  return t("usage.resetsAt", { date: new Intl.DateTimeFormat(getLocale(), {
     weekday: "short",
     month: "short",
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
-  }).format(date)}`;
+  }).format(date) });
 }
 
 export function todayTokens(source, today = new Date()) {
@@ -189,7 +206,10 @@ export function visibleLocalDownload(localModels = {}) {
   if (!download) return null;
   if (download.status !== "done" || !download.tag) return download;
   const installed = new Set((localModels.models || []).map((model) => model.tag));
-  return installed.has(download.tag) ? download : null;
+  // A completed removal normally disappears once its row is gone. Keep a
+  // terminal warning visible when publication failed, though, so “removed”
+  // is not silently mistaken for “the catalog is already refreshed.”
+  return installed.has(download.tag) || download.catalogError || download.restartError ? download : null;
 }
 
 export function observedModelSpeed(providerUsage, providerId, modelSlug) {

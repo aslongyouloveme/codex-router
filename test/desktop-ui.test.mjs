@@ -6,10 +6,12 @@ import {
   chartGeometry,
   compactTokens,
   dailySeries,
+  metricRemainingPercent,
   observedModelSpeed,
   quotaWindow,
   visibleLocalDownload,
 } from "../apps/desktop/ui/model.mjs";
+import { availableLanguages, getLanguage, setLanguage, t, translationKeys } from "../apps/desktop/ui/i18n.mjs";
 
 test("desktop usage series fills missing local calendar days", () => {
   const series = dailySeries(
@@ -39,6 +41,21 @@ test("quota windows use one weekly label and a distinct five-hour label", () => 
   assert.deepEqual(quotaWindow({ windowDurationMins: 300 }), {
     key: "five-hour",
     label: "5-hour limit",
+  });
+});
+
+test("monthly quota windows keep their own label instead of being dropped", () => {
+  assert.deepEqual(quotaWindow({ label: "Monthly limit" }), {
+    key: "monthly",
+    label: "Monthly limit",
+  });
+  assert.deepEqual(quotaWindow({ label: "Monthly subscription" }), {
+    key: "monthly",
+    label: "Monthly limit",
+  });
+  assert.deepEqual(quotaWindow({ windowDurationMins: 43_200 }), {
+    key: "monthly",
+    label: "Monthly limit",
   });
 });
 
@@ -79,6 +96,19 @@ test("quota cards omit unconfigured providers and de-duplicate synonymous window
       { providerId: "kimi-oauth", label: "5-hour limit" },
     ],
   );
+  assert.deepEqual(
+    cards.map(({ usedPercent, remainingPercent }) => ({ usedPercent, remainingPercent })),
+    [
+      { usedPercent: 48, remainingPercent: 52 },
+      { usedPercent: 3, remainingPercent: 97 },
+    ],
+  );
+});
+
+test("quota remaining percentage prefers provider data and derives from usage", () => {
+  assert.equal(metricRemainingPercent({ usedPercent: 35 }), 65);
+  assert.equal(metricRemainingPercent({ used: 25, limit: 100 }), 75);
+  assert.equal(metricRemainingPercent({ usedPercent: 35, remainingPercent: 72 }), 72);
 });
 
 test("chart geometry stays finite for an empty week", () => {
@@ -101,6 +131,17 @@ test("completed local downloads disappear when the model is no longer installed"
   assert.deepEqual(
     visibleLocalDownload({ models: [{ tag: "gemma4:12b" }], download: done }),
     done,
+  );
+  const removedWithWarning = {
+    tag: "gemma4:12b",
+    kind: "uninstall",
+    status: "done",
+    detail: "Model removed · catalog refresh needed",
+    catalogError: "The Codex catalog could not be refreshed.",
+  };
+  assert.deepEqual(
+    visibleLocalDownload({ models: [], download: removedWithWarning }),
+    removedWithWarning,
   );
   const active = { tag: "gemma4:12b", status: "downloading", percent: 42 };
   assert.deepEqual(visibleLocalDownload({ models: [], download: active }), active);
@@ -129,4 +170,19 @@ test("active model speed prefers its provider and matches qualified slugs", () =
   usage.providers[0].models[0].observedTokensPerSecond = null;
   assert.equal(observedModelSpeed(usage, "deepseek", "deepseek/deepseek-v4-flash"), null);
   assert.equal(observedModelSpeed(usage, "deepseek", "missing/model"), null);
+});
+
+test("desktop UI exposes English and Simplified Chinese translations", () => {
+  assert.deepEqual(availableLanguages().map(({ id }) => id), ["en", "zh-CN"]);
+  const keys = translationKeys();
+  assert.deepEqual([...keys.en].sort(), [...keys["zh-CN"]].sort());
+  try {
+    setLanguage("zh-CN");
+    assert.equal(getLanguage(), "zh-CN");
+    assert.equal(t("nav.usage"), "用量");
+    assert.equal(t("usage.resetsToday", { time: "10:30" }), "今天 10:30 重置");
+  } finally {
+    setLanguage("en");
+  }
+  assert.equal(t("nav.usage"), "Usage");
 });

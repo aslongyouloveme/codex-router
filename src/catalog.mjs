@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -15,6 +16,7 @@ import {
   ANNOUNCED_MODELS_PATH,
   CONFIG_PATH,
   MERGED_CATALOG_PATH,
+  MODELS_CACHE_PATH,
   NATIVE_ALIAS_PATH,
   NATIVE_CATALOG_PATH,
 } from "./paths.mjs";
@@ -27,6 +29,7 @@ import {
   readMultiAgentSettings,
   subagentEligibleModels,
 } from "./multi-agent-state.mjs";
+import { applySubagentProofs, subagentProofSnapshot } from "./subagent-proofs.mjs";
 import { readHiddenModels } from "./model-picker-state.mjs";
 import { buildNativeAliasAssignments } from "./native-alias.mjs";
 import { selectedConfiguredListedModels, configuredProviderIds } from "./provider-selection.mjs";
@@ -39,9 +42,140 @@ import {
   readNativeCatalogFile,
   readNativeCatalogSource,
 } from "./native-catalog-source.mjs";
+import { discoveryDisabled } from "./discovery-mode.mjs";
 
 const refresh = process.argv.includes("--refresh-native");
-const bundled = process.argv.includes("--bundled-native");
+
+function validNativeCatalog(parsed) {
+  return parsed && Array.isArray(parsed.models) && parsed.models.length > 0;
+}
+
+// The account cache stores the raw instruction template while the bundled
+// catalog ships `base_instructions` with the template variables already
+// substituted: for every shared slug that carries variables, the bundled
+// `base_instructions` equals the account template with `{{ personality }}`
+// replaced by `instructions_variables.personality_default`. Mirror that
+// substitution — and strip any placeholder without a default — so a literal
+// `{{ ... }}` token can never reach a model's system prompt.
+const INSTRUCTION_PLACEHOLDER = /\{\{\s*([\w.-]+)\s*\}\}/g;
+
+export function deriveBaseInstructions(modelMessages) {
+  const template = modelMessages?.instructions_template;
+  if (typeof template !== "string") return undefined;
+  const variables = modelMessages?.instructions_variables;
+  const substituted = template.replace(INSTRUCTION_PLACEHOLDER, (_token, name) => {
+    const fallback = variables?.[`${name}_default`];
+    return typeof fallback === "string" ? fallback : "";
+  });
+  // A default could itself contain a placeholder; the guarantee is that none
+  // survive, not that substitution is recursive.
+  return substituted.replace(INSTRUCTION_PLACEHOLDER, "");
+}
+
+// Codex has two native catalogs: the account-aware catalog (`debug models`)
+// and the static catalog shipped in the binary (`--bundled`). Neither is a
+// safe source by itself. The account catalog can add models or change their
+// visibility without a client update, while the bundled catalog can contain a
+// newer schema or models absent from a stale account cache. Preserve the
+// account entry for every slug it lists (first occurrence wins on a
+// duplicate), then append bundled-only entries.
+export function mergeNativeCatalogs(accountCatalog, bundledCatalog) {
+  const account = validNativeCatalog(accountCatalog) ? accountCatalog.models : [];
+  const fallback = validNativeCatalog(bundledCatalog) ? bundledCatalog.models : [];
+  const fallbackBySlug = new Map(
+    fallback.map((model) => [String(model?.slug || ""), model]),
+  );
+  const normalizedAccount = [];
+  const seen = new Set();
+  for (const model of account) {
+    const slug = String(model?.slug || "");
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    const base = fallbackBySlug.get(slug);
+    const merged = mergeNativeModel(model, base);
+    // The remote cache may omit `base_instructions` because Codex can derive
+    // it internally. A custom model_catalog_json is parsed more strictly and
+    // requires the field, so derive it the same way for account-only models
+    // such as Codex Spark.
+    if (typeof merged.base_instructions !== "string") {
+      const derived = deriveBaseInstructions(merged.model_messages);
+      if (typeof derived === "string") merged.base_instructions = derived;
+    }
+    normalizedAccount.push(merged);
+  }
+  return {
+    models: [
+      ...normalizedAccount,
+      ...fallback.filter((model) => !seen.has(String(model?.slug || ""))),
+    ],
+  };
+}
+
+function isEmptyNativeMetadata(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value === "string") return value.trim() === "";
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "object") return Object.keys(value).length === 0;
+  return false;
+}
+
+// Only fields where an empty account value can never be a deliberate account
+// narrowing may be backfilled from the bundled catalog. Each entry earns its
+// place: the speed/service tiers are the observed bug (a stale account schema
+// wiped the Fast tier), `input_modalities: []` would describe a model nothing
+// can call, and the tool/instruction fields are binary-schema data the account
+// cache merely mirrors. Deliberately absent: `visibility` (the account's own
+// signal, always non-empty in practice but not worth betting on) and
+// `supported_reasoning_levels` (an account that lost an effort ladder is
+// expressing exactly that — resurrecting bundled's ladder would offer efforts
+// the account cannot spend).
+const BUNDLED_BACKFILL_FIELDS = Object.freeze([
+  "additional_speed_tiers",
+  "service_tiers",
+  "input_modalities",
+  "experimental_supported_tools",
+  "include_apps_usage_instructions",
+  "model_messages",
+]);
+
+// The account catalog may use an older schema and publish empty fields for
+// capabilities already present in the current binary. Preserve the non-empty
+// bundled value for the allowlisted schema fields in that case; a non-empty
+// account value always remains authoritative.
+export function mergeNativeModel(accountModel, bundledModel) {
+  if (!bundledModel) return { ...accountModel };
+
+  const merged = { ...bundledModel, ...accountModel };
+  for (const field of BUNDLED_BACKFILL_FIELDS) {
+    const value = bundledModel[field];
+    if (
+      !isEmptyNativeMetadata(value) &&
+      isEmptyNativeMetadata(accountModel[field])
+    ) {
+      merged[field] = value;
+    }
+  }
+  return merged;
+}
+
+// One read serves both the catalog contents and the fingerprint; reading the
+// file twice would hash a possibly different snapshot than the one merged.
+function readModelsCache() {
+  const missing = { catalog: undefined, fingerprint: undefined };
+  if (!existsSync(MODELS_CACHE_PATH)) return missing;
+  try {
+    const parsed = JSON.parse(readFileSync(MODELS_CACHE_PATH, "utf8"));
+    if (!validNativeCatalog(parsed)) return missing;
+    return {
+      catalog: parsed,
+      fingerprint: createHash("sha256")
+        .update(JSON.stringify(parsed.models))
+        .digest("hex"),
+    };
+  } catch {
+    return missing;
+  }
+}
 
 function atomicContents(target, contents) {
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
@@ -73,27 +207,51 @@ function restoreFileSnapshot(target, snapshot) {
   }
 }
 
-function captureNative() {
-  const args = ["debug", "models"];
-  if (bundled) args.push("--bundled");
-  let output;
-  try {
-    output = runCodex(args, {
-      encoding: "utf8",
-      timeout: 30_000,
-      maxBuffer: 32 * 1024 * 1024,
-    });
-  } catch (error) {
-    if (bundled) throw error;
-    output = runCodex(["debug", "models", "--bundled"], {
-      encoding: "utf8",
-      timeout: 30_000,
-      maxBuffer: 32 * 1024 * 1024,
-    });
+function captureNative(cache) {
+  // A discovery-disabled install promised that nothing account-derived is
+  // read: `debug models` without --bundled reflects the signed-in account's
+  // catalog, and `models_cache.json` is that same catalog written to disk, so
+  // both stay untouched and the bundled static list is the whole capture.
+  // This is the gate SECURITY.md's "the one Codex spawn that remains is
+  // `codex debug models --bundled`" claim rests on.
+  const idle = discoveryDisabled();
+  const resolved = cache ?? (idle ? {} : readModelsCache());
+  // This is the account-aware catalog Codex itself cached after signing in.
+  // Reading it directly also avoids asking `codex debug models` while the
+  // router catalog is active, which would merely return our own merged output.
+  let account = resolved.catalog;
+  let fallback;
+  let accountError;
+  let fallbackError;
+  if (!account && !idle) {
+    try {
+      account = JSON.parse(runCodex(["debug", "models"], {
+        encoding: "utf8",
+        timeout: 30_000,
+        maxBuffer: 32 * 1024 * 1024,
+      }));
+    } catch (error) {
+      accountError = error;
+    }
   }
-  const parsed = JSON.parse(output);
-  if (!parsed || !Array.isArray(parsed.models) || parsed.models.length === 0) {
-    throw new Error("Codex returned an empty or invalid model catalog.");
+  // The bundled source supplies schema fields that the remote cache is allowed
+  // to omit, so use both when available. If it fails, account-only entries are
+  // still normalized above and remain preferable to an empty picker.
+  try {
+    fallback = JSON.parse(runCodex(["debug", "models", "--bundled"], {
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: 32 * 1024 * 1024,
+    }));
+  } catch (error) {
+    fallbackError = error;
+  }
+  const parsed = mergeNativeCatalogs(account, fallback);
+  if (!validNativeCatalog(parsed)) {
+    const detail = accountError?.message || fallbackError?.message;
+    throw new Error(
+      `Codex returned no valid native model catalog${detail ? ` (${detail})` : ""}.`,
+    );
   }
   if (parsed.models.some((model) => MODEL_BY_SLUG.has(String(model.slug)))) {
     throw new Error(
@@ -101,8 +259,10 @@ function captureNative() {
     );
   }
   const capturedWith = codexVersion();
+  const sourceFingerprint = cache.fingerprint;
   atomicJson(NATIVE_CATALOG_PATH, {
     ...(capturedWith ? { captured_with: capturedWith } : {}),
+    ...(sourceFingerprint ? { native_source_fingerprint: sourceFingerprint } : {}),
     models: parsed.models,
   });
   return parsed;
@@ -113,11 +273,22 @@ function captureNative() {
 // carry different capability values for the same slug. An unknown current
 // version keeps the cache — with no binary to re-ask, stale is the best we
 // have.
-export function nativeCatalogIsReusable(parsed, currentVersion) {
+export function nativeCatalogIsReusable(
+  parsed,
+  currentVersion,
+  currentSourceFingerprint = undefined,
+) {
   if (!parsed || !Array.isArray(parsed.models) || parsed.models.length === 0) {
     return false;
   }
-  return !currentVersion || parsed.captured_with === currentVersion;
+  if (currentVersion && parsed.captured_with !== currentVersion) return false;
+  if (
+    currentSourceFingerprint &&
+    parsed.native_source_fingerprint !== currentSourceFingerprint
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function nativeCatalog() {
@@ -131,11 +302,17 @@ function nativeCatalog() {
     }
     return catalog;
   }
-  if (!existsSync(NATIVE_CATALOG_PATH) || refresh) return captureNative();
+  // `models_cache.json` is the signed-in account's catalog written to disk,
+  // so a discovery-disabled install leaves it unread like every other
+  // account-derived artifact.
+  const cache = discoveryDisabled() ? {} : readModelsCache();
+  if (!existsSync(NATIVE_CATALOG_PATH) || refresh) return captureNative(cache);
   const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
-  if (nativeCatalogIsReusable(parsed, codexVersion())) return parsed;
+  if (nativeCatalogIsReusable(parsed, codexVersion(), cache.fingerprint)) {
+    return parsed;
+  }
   try {
-    return captureNative();
+    return captureNative(cache);
   } catch (error) {
     // Version-mismatched is still better than empty: serve the stale capture
     // when the re-capture fails, but say so instead of hiding it.
@@ -406,11 +583,6 @@ export function routedModel(template, model) {
   return next;
 }
 
-export function applyAllMultiAgent(models, enabled) {
-  if (!enabled) return models;
-  return models.map((model) => ({ ...model, multiAgentVersion: "v2" }));
-}
-
 export const AUTO_ANNOUNCE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 function formatTokenCount(tokens) {
@@ -504,9 +676,14 @@ function sortCatalogModels(models) {
 // still ships gpt-5.6-luna as "v1" even though it runs correctly on the v2
 // backend (openai/codex#35097, #36294). spawn_agent filters candidate child
 // models on that static value, so a v1 entry can never be delegated to by a v2
-// parent. applyMultiAgentSettings only reaches routed models, which is why
-// "all" mode never promoted the native slugs; apply the same opt-in here so the
-// subagent modes mean what the Settings tab says they mean.
+// parent.
+//
+// These upstream-verified slugs run fine on the v2 backend, so they are
+// promoted unconditionally — no mode switch, no Settings dance. The subagent
+// opt-in below only reaches the *remaining* native models, which stay
+// conservative because their v2 relay paths have not been verified.
+const NATIVE_V2_BACKEND_SLUGS = new Set(["gpt-5.6-luna"]);
+
 export function promoteNativeMultiAgent(models, settings, hidden = new Set()) {
   const enabled = new Set(settings.enabled || []);
   const disabled = new Set(settings.disabled || []);
@@ -514,6 +691,9 @@ export function promoteNativeMultiAgent(models, settings, hidden = new Set()) {
     const slug = String(model.slug);
     if (model.visibility !== "list") return model;
     if (hidden.has(slug) || disabled.has(slug)) return model;
+    if (NATIVE_V2_BACKEND_SLUGS.has(slug)) {
+      return { ...model, multi_agent_version: "v2" };
+    }
     if (settings.mode === "all" || (settings.mode === "selected" && enabled.has(slug))) {
       return { ...model, multi_agent_version: "v2" };
     }
@@ -584,10 +764,14 @@ function main() {
   const hiddenModels = readHiddenModels();
   const selectedModels = selectedConfiguredListedModels();
   const multiAgentSettings = readMultiAgentSettings();
-  const allMultiAgentModels = applyMultiAgentSettings(
-    selectedModels,
-    multiAgentSettings,
-    hiddenModels,
+  // Demotions first, then this machine's own recorded proofs. Settings still
+  // never manufacture a v2 claim — a promotion here traces to a live probe
+  // or an observed spawn in `multi-agent-proofs.json` — and a slug the
+  // operator hid or switched off stays v1 whatever evidence it carries.
+  const allMultiAgentModels = applySubagentProofs(
+    applyMultiAgentSettings(selectedModels, multiAgentSettings, hiddenModels),
+    subagentProofSnapshot(),
+    { hidden: hiddenModels, disabled: multiAgentSettings.disabled },
   );
   // Clamp before announcements and agent sync so every surface Codex reads —
   // picker levels, defaults, and announcement copy — stays inside the effort

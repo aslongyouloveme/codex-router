@@ -4,18 +4,36 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { pickerCommandArgs } from "./control-args.mjs";
+// The publish marker lives under the shared state directory, which does not
+// vary by target, so reading it here does not disturb the per-target probes
+// below that re-import paths with their own MODEL_ROUTER_TARGET.
+import { DSH_CATALOG_PATH } from "./paths.mjs";
+// Same reasoning: presence is a property of the shared plane, not of a target,
+// so the overview can resolve it statically without perturbing those probes.
+import { presenceSnapshot } from "./presence-state.mjs";
+import { harnessSnapshotWithWeb } from "./dsh-install.mjs";
 
 // Cross-target control plane for a tray/UI (e.g. the planned pane fork). It
 // reads which registry models are enabled per target and toggles them. Toggling
 // only rewrites each target's provider selection; making it live is a separate
 // explicit `apply`, so a toggle never silently restarts a running target.
 
-const TARGETS = ["codex"];
 const SELF = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(SELF), "..");
+// The harness integration appears here only once it is installed. The tray
+// renders one section per target, so listing `dsh` unconditionally would put an
+// empty section in front of every Codex-only install for a client they do not
+// run. `dsh-models.json` is written by the publish and removed by the
+// uninstall, so its presence is exactly the question being asked.
+const DSH_PUBLISHED = DSH_CATALOG_PATH;
+const TARGETS = existsSync(DSH_PUBLISHED) ? ["codex", "dsh"] : ["codex"];
 const args = process.argv.slice(2);
 
 function targetIsActive(target) {
+  // One service serves every client, so "is this target active" cannot be the
+  // service's own status for more than one of them. For the harness it is
+  // whether the route has been published into its settings document.
+  if (target === "dsh") return existsSync(DSH_PUBLISHED);
   const result = spawnSync(process.execPath, [path.join(REPO_ROOT, "src", "service.mjs"), "status"], {
     env: { ...process.env, MODEL_ROUTER_TARGET: target },
     encoding: "utf8",
@@ -96,6 +114,7 @@ async function emitProbe() {
   const { readNativeAliases } = await import("./native-alias.mjs");
   const { subagentSettingsSnapshot } = await import("./multi-agent-state.mjs");
   const { modelPickerSnapshot } = await import("./model-picker-state.mjs");
+  const { toolResultAgingSnapshot } = await import("./tool-result-aging-state.mjs");
   const { readVisionBridgeSettings, visionBridgeSnapshot } = await import(
     "./vision-bridge-state.mjs"
   );
@@ -114,20 +133,46 @@ async function emitProbe() {
     [...new Set([...Object.keys(visionBenchmarks), ...Object.keys(localBenchmarks)])]
       .map((tag) => [tag, { ...visionBenchmarks[tag], ...localBenchmarks[tag] }]),
   );
-  const { localModelsSnapshot } = await import("./local-models.mjs");
+  const { localModelInventory, localModelsSnapshot, runningLocalModels } = await import(
+    "./local-models.mjs",
+  );
+  const { localOllamaRuntimeSnapshot } = await import("./ollama-runtime.mjs");
   const { selectedConfiguredListedModels } = await import("./provider-selection.mjs");
   // Bounded and weekly: the tray reads this snapshot constantly, so a fresh
   // cache costs nothing and a stale one costs one short, failure-tolerant pass.
   if (TARGET === "codex") await refreshVisionModelSizesIfStale();
+  // One probe serves several tray sections. Reuse the local reads so the same
+  // snapshot does not run `ollama list` and the hardware checks once per view.
+  const localInventory = TARGET === "codex" ? localModelInventory() : [];
+  const localRunning = TARGET === "codex" ? runningLocalModels() : [];
+  const localProfile = TARGET === "codex" ? hostVisionProfile() : undefined;
+  const localRuntime = TARGET === "codex" ? localOllamaRuntimeSnapshot() : undefined;
+  const localInstalled = localInventory.map((model) => model.tag);
 
   const enabledProviders = readProviderSelection();
   const hiddenModels = new Set(modelPickerSnapshot().hidden);
   const usageEvents = TARGET === "codex"
     ? (await import("./usage-events.mjs")).recentUsageEvents()
     : [];
+  // The same machine-local capability proofs the catalog honors: the tray's
+  // "Subagent models" section filters on v2, so a probe built from the raw
+  // registry hid every model this machine had just verified — the third
+  // consumer to need this overlay, after the catalog and the DSH preset.
+  //
+  // Deliberately unlike the catalog, `disabled` is not passed: the catalog
+  // demotes a switched-off model so Codex stops offering it, but this probe
+  // is what draws the rows the operator switches. A proven model whose
+  // toggle is off must keep its row — with the toggle shown off — or the
+  // section it was switched off in loses the way to switch it back on.
+  const { applySubagentProofs } = await import("./subagent-proofs.mjs");
+  const provenListedModels = applySubagentProofs(
+    LISTED_MODELS,
+    subagentSettingsSnapshot().proofs,
+    { hidden: hiddenModels },
+  );
   // The tray groups models by provider to build its rows, so protocol
   // variants report their canonical family id: one opencode Go row, not three.
-  const routedModels = LISTED_MODELS.map((model) => ({
+  const routedModels = provenListedModels.map((model) => ({
     slug: model.slug,
     displayName: model.displayName,
     provider: canonicalProviderId(model.provider),
@@ -154,6 +199,16 @@ async function emitProbe() {
           id: provider.id,
           displayName: provider.displayName,
           kind: provider.kind,
+          // The vendor, so a UI can group the rows a `variantOf` cannot merge.
+          // Z.ai, Kimi, and xAI each publish several providers that are one
+          // brand but genuinely separate accounts -- different endpoints, and
+          // keys that are not interchangeable -- so they must stay separately
+          // connectable while still reading as one vendor.
+          ownedBy: provider.ownedBy,
+          // An anonymous gateway is not an account, so the tray needs this to
+          // keep one out of a vendor's "N accounts" group (opencode-free would
+          // otherwise be drawn as a second opencode account).
+          authMode: provider.authMode,
         })),
       models,
       ...(selectedModel ? { selectedModel } : {}),
@@ -172,7 +227,13 @@ async function emitProbe() {
             modelSettings: {
               subagents: subagentSettingsSnapshot(),
               picker: modelPickerSnapshot(),
-              localModels: localModelsSnapshot({ benchmarks: localAndVisionBenchmarks }),
+              toolResultAging: toolResultAgingSnapshot(),
+              localModels: localModelsSnapshot({
+                inventory: localInventory,
+                running: localRunning,
+                runtime: localRuntime,
+                benchmarks: localAndVisionBenchmarks,
+              }),
               visionBridge: (() => {
                 const candidates = selectedConfiguredListedModels();
                 // Only the native models that actually shipped into the picker.
@@ -190,7 +251,7 @@ async function emitProbe() {
                   ...visionBridgeSnapshot(),
                   resolvedEngine: resolved?.slug || null,
                   resolvedEngineName: resolved?.displayName || null,
-                  hostMemGib: hostVisionProfile().memGib,
+                  hostMemGib: localProfile.memGib,
                   // Cloud vision models the operator already pays for -- the
                   // default engines. Auto picks the cheapest of these.
                   paidEngines: rankVisionEngines(candidates).map((model) => ({
@@ -208,7 +269,11 @@ async function emitProbe() {
                     efforts: visionEngineEfforts(model),
                   })),
                   // The downloadable local picker, each with size + fit + state.
-                  localModels: annotateLocalModels({ benchmarks: readBenchmarkResults() }),
+                  localModels: annotateLocalModels({
+                    profile: localProfile,
+                    installed: localInstalled,
+                    benchmarks: localAndVisionBenchmarks,
+                  }),
                   download: readVisionDownload(),
                 };
               })(),
@@ -250,10 +315,22 @@ function probeTargets() {
   return targets;
 }
 
-function printOverview(asJson) {
+async function printOverview(asJson) {
   const targets = probeTargets();
   if (asJson) {
-    process.stdout.write(`${JSON.stringify({ targets }, null, 2)}\n`);
+    // The tray polls this. Presence rides along so the rule that decides
+    // whether the router may be stopped is computed once, here, rather than
+    // re-derived from target flags on the Swift side where it would drift.
+    // The harness snapshot joins it for the same reason -- and it has to be
+    // the variant that probes the web port, or the tray reads every running
+    // harness as stopped and offers to start one that is already up.
+    process.stdout.write(
+      `${JSON.stringify(
+        { targets, presence: presenceSnapshot(), harness: await harnessSnapshotWithWeb() },
+        null,
+        2,
+      )}\n`,
+    );
     return;
   }
   for (const target of TARGETS) {
@@ -270,7 +347,7 @@ function printOverview(asJson) {
   }
 }
 
-function runSet(provider, desired) {
+async function runSet(provider, desired) {
   const requested = optionValue("--targets");
   const selected = requested ? requested.split(",").map((value) => value.trim()) : TARGETS;
   for (const target of selected) {
@@ -286,14 +363,16 @@ function runSet(provider, desired) {
   process.stderr.write(
     `Set ${provider} ${desired} for: ${selected.join(", ")}. Run \`bin/control apply\` to make it live.\n`,
   );
-  printOverview(args.includes("--json"));
+  await printOverview(args.includes("--json"));
 }
 
 function refreshActiveTarget(target) {
   const command =
     target === "codex"
       ? [process.execPath, [path.join(REPO_ROOT, "src", "catalog.mjs")]]
-      : undefined;
+      : target === "dsh"
+        ? [process.execPath, [path.join(REPO_ROOT, "src", "dsh-config-manager.mjs"), "install"]]
+        : undefined;
   if (!command) return;
   const result = spawnSync(command[0], command[1], {
     env: { ...process.env, MODEL_ROUTER_TARGET: target },
@@ -304,7 +383,7 @@ function refreshActiveTarget(target) {
 
 // Active routers read provider selection on each request, so only their picker
 // catalog needs refreshing. The full enable path is reserved for inactive targets.
-function runApply() {
+async function runApply() {
   const requested = optionValue("--targets");
   const selected = requested ? requested.split(",").map((value) => value.trim()) : TARGETS;
   const activate = args.includes("--activate");
@@ -319,7 +398,16 @@ function runApply() {
     if (targetIsActive(target)) {
       refreshActiveTarget(target);
     } else {
-      const result = spawnSync(path.join(REPO_ROOT, "bin", "enable"), [], {
+      // `bin/enable` is a POSIX shell script; spawning it on Windows failed
+      // with ENOEXEC and reported it as a plain "apply failed". The shared
+      // helper already knows each platform's checkout entry point and is unit
+      // tested, so this branch is no longer a second untested copy.
+      const { currentCheckoutInstaller } = await import("./update.mjs");
+      const enable = currentCheckoutInstaller(process.platform, target, {
+        posixScript: "enable",
+      });
+      const result = spawnSync(enable.command, enable.args, {
+        cwd: REPO_ROOT,
         env: { ...process.env, MODEL_ROUTER_TARGET: target },
         stdio: "inherit",
       });
@@ -579,19 +667,42 @@ async function updateAndVerifyCodex() {
 }
 
 function runDoctor(args) {
+  const json = args.includes("--json");
   const result = spawnSync(
     process.execPath,
     [path.join(REPO_ROOT, "src", "doctor.mjs"), ...args],
     {
       cwd: REPO_ROOT,
       env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
-      stdio: "inherit",
+      stdio: json ? ["inherit", "pipe", "pipe"] : "inherit",
+      ...(json ? { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 } : {}),
     },
   );
+  if (result.error) throw result.error;
   if (result.status !== 0) {
+    if (json) {
+      try {
+        const report = JSON.parse(String(result.stdout || ""));
+        const failed = Array.isArray(report?.checks)
+          ? report.checks.filter((check) => check.status === "fail").map((check) => check.name)
+          : [];
+        if (failed.length) throw new Error(`Doctor found problems: ${failed.join(", ")}.`);
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Doctor found problems:")) throw error;
+      }
+    }
     throw new Error(
       (result.stderr || "The Codex doctor could not finish.").trim(),
     );
+  }
+  if (json) {
+    try {
+      const report = JSON.parse(String(result.stdout || ""));
+      process.stdout.write(`${JSON.stringify(report)}\n`);
+    } catch {
+      throw new Error("The Codex doctor returned an unreadable report.");
+    }
+    return;
   }
   process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
 }
@@ -639,6 +750,21 @@ async function restartRouterForLocalRoutes() {
   return restarted;
 }
 
+async function finalizeLocalModelPublication() {
+  const warnings = {};
+  try {
+    refreshModelSettingsCatalog({ routes: true });
+  } catch (error) {
+    warnings.catalogError = error instanceof Error ? error.message : String(error);
+  }
+  try {
+    await restartRouterForLocalRoutes();
+  } catch (error) {
+    warnings.restartError = error instanceof Error ? error.message : String(error);
+  }
+  return warnings;
+}
+
 async function knownModelSlug(slug) {
   try {
     const { MERGED_CATALOG_PATH } = await import("./paths.mjs");
@@ -656,7 +782,7 @@ async function knownModelSlug(slug) {
   return MODEL_BY_SLUG.has(slug);
 }
 
-async function handleSubagents(action, value, flag) {
+async function handleSubagents(action, value, flag, rest = []) {
   const {
     replaceMultiAgentState,
     setMultiAgentMode,
@@ -684,6 +810,19 @@ async function handleSubagents(action, value, flag) {
     });
   } else if (action === "mode") {
     setMultiAgentMode(value);
+  } else if (action === "verify") {
+    // Explicit re-research: probe the named slugs (or every enabled one) in
+    // the foreground and print the verdicts. Spends ~2 live requests per
+    // candidate on that model's own provider.
+    const { verifySubagentCandidates } = await import("./subagent-verify.mjs");
+    const targets = rest.filter(Boolean);
+    const sweep = targets.length
+      ? targets
+      : subagentSettingsSnapshot().enabled;
+    const verified = await verifySubagentCandidates(sweep, { force: targets.length > 0 });
+    refreshModelSettingsCatalog();
+    process.stdout.write(`${JSON.stringify({ verified })}\n`);
+    return;
   } else if (action === "set") {
     if (!["on", "off"].includes(flag)) {
       throw new Error("Usage: control subagents set <model-slug> <on|off>");
@@ -692,6 +831,14 @@ async function handleSubagents(action, value, flag) {
       throw new Error(`Unknown model slug: ${value}`);
     }
     setMultiAgentModel(value, flag === "on");
+    // Selection is the assignment: switching a model on hands it to the
+    // capability probe. Detached, because this command answers a tray toggle
+    // and cannot sit on a live network round-trip; the proofs snapshot shows
+    // "checking" until the worker records a verdict and republishes.
+    if (flag === "on") {
+      const { spawnDetachedVerification } = await import("./subagent-verify.mjs");
+      spawnDetachedVerification([value]);
+    }
   } else if (action === "provider") {
     if (!["on", "off"].includes(flag)) {
       throw new Error("Usage: control subagents provider <provider-id> <on|off>");
@@ -707,14 +854,44 @@ async function handleSubagents(action, value, flag) {
       throw new Error(`No enabled models found for provider: ${value}`);
     }
     setMultiAgentModels(slugs, flag === "on");
+    if (flag === "on") {
+      const { spawnDetachedVerification } = await import("./subagent-verify.mjs");
+      spawnDetachedVerification(slugs);
+    }
   } else {
     throw new Error(
       "Usage: control subagents status|select-all|unselect-all|mode <all|selected|proven>|" +
-        "set <model-slug> <on|off>|provider <provider-id> <on|off>",
+        "set <model-slug> <on|off>|provider <provider-id> <on|off>|verify [model-slug ...]",
     );
   }
   refreshModelSettingsCatalog();
   process.stdout.write(`${JSON.stringify(subagentSettingsSnapshot())}\n`);
+}
+
+async function handleToolResultAging(action, nativeAction) {
+  const {
+    setNativeToolResultAgingEnabled,
+    setToolResultAgingEnabled,
+    toolResultAgingSnapshot,
+  } = await import("./tool-result-aging-state.mjs");
+  const desired = action || "status";
+  if (desired === "status") {
+    process.stdout.write(`${JSON.stringify(toolResultAgingSnapshot())}\n`);
+    return;
+  }
+  if (desired === "native") {
+    if (nativeAction !== "on" && nativeAction !== "off") {
+      throw new Error("Usage: control tool-result-aging status|on|off|native <on|off>");
+    }
+    setNativeToolResultAgingEnabled(nativeAction === "on");
+    process.stdout.write(`${JSON.stringify(toolResultAgingSnapshot())}\n`);
+    return;
+  }
+  if (desired !== "on" && desired !== "off") {
+    throw new Error("Usage: control tool-result-aging status|on|off|native <on|off>");
+  }
+  setToolResultAgingEnabled(desired === "on");
+  process.stdout.write(`${JSON.stringify(toolResultAgingSnapshot())}\n`);
 }
 
 // The bridge changes what the picker advertises (image input on text-only
@@ -880,7 +1057,10 @@ async function handleVisionBridge(action, value, extra) {
     const child = spawn(
       process.execPath,
       [path.join(REPO_ROOT, "src", "vision-download.mjs"), tag],
-      { detached: true, stdio: "ignore" },
+      // windowsHide matters more here than anywhere else: a detached child
+      // gets its own console on Windows, and this one lives for the length of
+      // a multi-gigabyte pull. The local-model worker below already hides.
+      { detached: true, stdio: "ignore", windowsHide: true },
     );
     child.unref();
     process.stdout.write(`${JSON.stringify({ started: true, tag })}\n`);
@@ -1114,6 +1294,12 @@ async function handleLocalModels(action, value, ...rest) {
     process.stdout.write(`${JSON.stringify(result)}\n`);
     return;
   }
+  if (action === "cancel") {
+    const { cancelLocalDownload } = await import("./local-download.mjs");
+    const result = cancelLocalDownload(value);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
   if (action === "install" || action === "install-and-use") {
     // Same detached-worker principle as the vision picker, but this worker is
     // for Codex chat models: successful completion checks the model on and
@@ -1121,21 +1307,12 @@ async function handleLocalModels(action, value, ...rest) {
     const { normalizeLocalModelTag, splitLocalModelTag } = await import("./local-model-ref.mjs");
     const tag = normalizeLocalModelTag(value);
     const identity = splitLocalModelTag(tag);
-    const { readLocalDownload, writeLocalDownload } = await import("./local-download.mjs");
-    const active = readLocalDownload();
-    if (active?.status === "downloading" && active.tag !== tag) {
-      throw new Error(`${active.tag} is already downloading (${active.percent || 0}%).`);
-    }
-    if (active?.status === "downloading" && active.tag === tag) {
-      process.stdout.write(`${JSON.stringify({
-        started: false,
-        existing: true,
-        tag,
-        percent: active.percent || 0,
-        detail: active.detail || "downloading",
-      })}\n`);
-      return;
-    }
+    const {
+      claimLocalOperation,
+      isLocalOperationActive,
+      readLocalDownload,
+      writeLocalDownload,
+    } = await import("./local-download.mjs");
     const startedAt = Date.now();
     const writePhase = (detail, extra = {}) => writeLocalDownload({
       version: 1,
@@ -1145,17 +1322,67 @@ async function handleLocalModels(action, value, ...rest) {
       percent: 0,
       startedAt,
       updatedAt: Date.now(),
-      workerPid: process.pid,
+      kind: "download",
+      controllerPid: process.pid,
+      workerPid: null,
       ...extra,
     });
+    const claim = claimLocalOperation(tag, "download");
+    if (!claim.acquired) {
+      const active = readLocalDownload();
+      if (isLocalOperationActive(active) && active.tag !== tag) {
+        throw new Error(
+          active.status === "uninstalling"
+            ? `${active.tag} is already being removed.`
+            : `${active.tag} is already downloading (${active.percent || 0}%).`,
+        );
+      }
+      if (isLocalOperationActive(active) && active.tag === tag) {
+        process.stdout.write(`${JSON.stringify({
+          started: false,
+          existing: true,
+          tag,
+          percent: active.percent || 0,
+          detail: active.detail || "downloading",
+          kind: active.kind || (active.status === "uninstalling" ? "uninstall" : "download"),
+        })}\n`);
+        return;
+      }
+      throw new Error("Another local model operation is starting. Try again shortly.");
+    }
     // Persist the optimistic state before any network lookup or runtime
     // installation. The tray may refresh while either one is in progress, and
     // the operator should still see that the click was accepted.
-    writePhase("Checking model and machine fit");
+    try {
+      const active = readLocalDownload();
+      if (isLocalOperationActive(active) && active.tag !== tag) {
+        throw new Error(
+          active.status === "uninstalling"
+            ? `${active.tag} is already being removed.`
+            : `${active.tag} is already downloading (${active.percent || 0}%).`,
+        );
+      }
+      if (isLocalOperationActive(active) && active.tag === tag) {
+        process.stdout.write(`${JSON.stringify({
+          started: false,
+          existing: true,
+          tag,
+          percent: active.percent || 0,
+          detail: active.detail || "downloading",
+          kind: active.kind || (active.status === "uninstalling" ? "uninstall" : "download"),
+        })}\n`);
+        return;
+      }
+      writePhase("Checking model and machine fit");
+    } finally {
+      claim.release();
+    }
+    const cancelled = () => readLocalDownload()?.status === "cancelled";
     try {
       const { fetchRegistryCapabilities, detectMachine, fitAdvisory, rateDiskFit, rateModelFit } =
         await import("./local-models.mjs");
       const advertised = await fetchRegistryCapabilities(tag);
+      if (cancelled()) return;
       // A missing tool template costs nothing to discover afterwards; gigabytes
       // that cannot run cost the download and the disk. So the tool note stays
       // advisory while a model too large for this machine is refused unless the
@@ -1168,6 +1395,7 @@ async function handleLocalModels(action, value, ...rest) {
           `${fitAdvisory(tag, advertised.sizeGb, capacity) || `${tag} may not fit on this machine's free disk.`} Pass --force to download it anyway.`,
         );
       }
+      if (cancelled()) return;
       writePhase("Preparing headless Ollama");
       const { ensureOllamaHeadless, ollamaCommand } = await import("./ollama-runtime.mjs");
       // One action installs both. `--yes` is the operator's consent to touch
@@ -1183,6 +1411,7 @@ async function handleLocalModels(action, value, ...rest) {
         );
       }
       await ensureOllamaHeadless({ install: installRuntime });
+      if (cancelled()) return;
       writePhase("Starting model download");
       const child = spawn(process.execPath, [path.join(REPO_ROOT, "src", "local-download.mjs"), tag], {
         detached: true,
@@ -1193,12 +1422,14 @@ async function handleLocalModels(action, value, ...rest) {
       writeLocalDownload({
         ...readLocalDownload(),
         version: 1,
+        kind: "download",
         tag,
         status: "downloading",
         detail: "Starting model download",
         percent: 0,
         startedAt,
         updatedAt: Date.now(),
+        controllerPid: null,
         workerPid: child.pid,
       });
       // Advisory, never blocking: the operator may well want a vision-only
@@ -1226,9 +1457,11 @@ async function handleLocalModels(action, value, ...rest) {
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (cancelled()) return;
       writeLocalDownload({
         ...readLocalDownload(),
         version: 1,
+        kind: "download",
         tag,
         status: "error",
         detail: "failed",
@@ -1240,12 +1473,130 @@ async function handleLocalModels(action, value, ...rest) {
       throw error;
     }
   }
+  if (action === "finalize-uninstall") {
+    // Ollama removal has already completed by the time this cleanup step is
+    // reached.  Catalog/gateway refresh and a service restart are follow-up
+    // publication work: if either one is unavailable, report the warning but
+    // do not turn a successfully removed model into a false removal failure.
+    const warnings = await finalizeLocalModelPublication();
+    process.stdout.write(`${JSON.stringify({
+      finalized: true,
+      tag: value || null,
+      ...warnings,
+    })}\n`);
+    return;
+  }
   if (action === "uninstall") {
-    const tag = String(value || "").trim();
-    if (!tag) throw new Error("Usage: control local-models uninstall <model-tag> --yes");
+    const rawTag = String(value || "").trim();
+    if (!rawTag) throw new Error("Usage: control local-models uninstall <model-tag> --yes");
+    const { normalizeLocalModelTag } = await import("./local-model-ref.mjs");
+    const tag = normalizeLocalModelTag(rawTag);
+    const {
+      claimLocalOperation,
+      isLocalOperationActive,
+      readLocalDownload,
+      writeLocalDownload,
+    } = await import("./local-download.mjs");
+    const claim = claimLocalOperation(tag, "uninstall");
+    if (!claim.acquired) {
+      const active = readLocalDownload();
+      if (isLocalOperationActive(active) && active.tag === tag) {
+        process.stdout.write(`${JSON.stringify({
+          started: false,
+          existing: true,
+          tag,
+          kind: active.kind || (active.status === "uninstalling" ? "uninstall" : "download"),
+          status: active.status,
+        })}\n`);
+        return;
+      }
+      throw new Error("Another local model operation is starting. Try again shortly.");
+    }
+    try {
+    const active = readLocalDownload();
+    if (isLocalOperationActive(active) && active.tag !== tag) {
+      throw new Error(
+        active.status === "uninstalling"
+          ? `${active.tag} is already being removed.`
+          : `${active.tag} is already downloading (${active.percent || 0}%).`,
+      );
+    }
+    if (isLocalOperationActive(active) && active.tag === tag) {
+      process.stdout.write(`${JSON.stringify({
+        started: false,
+        existing: true,
+        tag,
+        kind: active.kind || (active.status === "uninstalling" ? "uninstall" : "download"),
+        status: active.status,
+      })}\n`);
+      return;
+    }
+    if (flags.has("--async")) {
+      const startedAt = Date.now();
+      writeLocalDownload({
+        version: 1,
+        kind: "uninstall",
+        tag,
+        status: "uninstalling",
+        detail: "Starting model removal",
+        percent: 0,
+        startedAt,
+        updatedAt: startedAt,
+        controllerPid: process.pid,
+        workerPid: null,
+      });
+      try {
+        const child = spawn(
+          process.execPath,
+          [path.join(REPO_ROOT, "src", "local-uninstall.mjs"), tag],
+          { detached: true, stdio: "ignore", windowsHide: true },
+        );
+        child.unref();
+        writeLocalDownload({
+          ...readLocalDownload(),
+          controllerPid: null,
+          workerPid: child.pid,
+          updatedAt: Date.now(),
+        });
+      } catch (error) {
+        writeLocalDownload({
+          ...readLocalDownload(),
+          status: "error",
+          detail: "Removal failed to start",
+          updatedAt: Date.now(),
+          controllerPid: null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+      process.stdout.write(`${JSON.stringify({ started: true, tag, kind: "uninstall" })}\n`);
+      return;
+    }
     removeLocalModel(tag, { confirmed: flags.has("--yes") || value === "--yes" });
-    refreshModelSettingsCatalog({ routes: true });
-    await restartRouterForLocalRoutes();
+    const warnings = await finalizeLocalModelPublication();
+    const finishedAt = Date.now();
+    writeLocalDownload({
+      version: 1,
+      kind: "uninstall",
+      tag,
+      status: "done",
+      detail: warnings.catalogError
+        ? "Model removed · catalog refresh needed"
+        : warnings.restartError
+          ? "Model removed · router restart needed"
+          : "Model removed",
+      percent: 100,
+      startedAt: finishedAt,
+      updatedAt: finishedAt,
+      workerPid: null,
+      controllerPid: null,
+      ...(warnings.catalogError ? { catalogError: warnings.catalogError } : {}),
+      ...(warnings.restartError ? { restartError: warnings.restartError } : {}),
+      error: undefined,
+    });
+    } finally {
+      claim.release();
+    }
   } else if (action === "set") {
     if (!["on", "off"].includes(positional)) {
       throw new Error("Usage: control local-models set <model-tag> <on|off>");
@@ -1263,7 +1614,7 @@ async function handleLocalModels(action, value, ...rest) {
       "Usage: control local-models list [--json]|inspect <tag-or-url>|" +
         "install <tag-or-url> [--yes] [--force]|benchmark <tag>|" +
         "runtime status|runtime start [--yes]|runtime update --yes|" +
-        "uninstall <tag> --yes|set <tag> <on|off>\n" +
+        "uninstall <tag> --yes|cancel [<tag>]|set <tag> <on|off>\n" +
         "  --yes    consent to installing/starting Ollama itself (headless)\n" +
         "  --force  download a model rated too large for this machine anyway",
     );
@@ -1357,12 +1708,17 @@ function handleService(action) {
   const result = spawnSync(
     process.execPath,
     [path.join(REPO_ROOT, "src", "service.mjs"), value],
-    { stdio: "inherit", env: process.env },
+    { stdio: ["inherit", "pipe", "pipe"], env: process.env, encoding: "utf8" },
   );
   if (result.error) throw result.error;
   if (result.status !== 0) {
-    throw new Error(`Background service ${value} failed with exit code ${result.status}.`);
+    throw new Error(
+      String(result.stderr || `Background service ${value} failed with exit code ${result.status}.`).trim(),
+    );
   }
+  const output = String(result.stdout || "").trim();
+  if (output) process.stdout.write(`${output}\n`);
+  else process.stdout.write(`${JSON.stringify({ state: value === "stop" ? "stopped" : "running" })}\n`);
 }
 
 // Supervision for the tray companion. `disable` boots the agent out, which
@@ -1372,9 +1728,43 @@ const TRAY_COMMANDS = { enable: "install", disable: "uninstall", status: "status
 
 function handleTray(action) {
   const value = action || "status";
+  if (value === "rebuild") {
+    // The tray's footer Restart control wants the bundle rebuilt from this
+    // checkout even when its source fingerprint says the installed copy is
+    // current, so this bypasses the update flow's staleness check and runs
+    // the launcher directly. The launcher quits the running tray only after
+    // the staged replacement passes verification. `bin/model-router-tray` is
+    // a POSIX shell script; Windows reaches the same sequence through
+    // `codex-router.ps1 tray rebuild`, which owns the cargo-or-Electron
+    // choice so it exists once instead of drifting between here and there.
+    const result = process.platform === "win32"
+      ? spawnSync(
+          "powershell.exe",
+          [
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            path.join(REPO_ROOT, "codex-router.ps1"),
+            "tray",
+            "rebuild",
+          ],
+          { stdio: "inherit", env: process.env },
+        )
+      : spawnSync(path.join(REPO_ROOT, "bin", "model-router-tray"), [], {
+          stdio: "inherit",
+          env: process.env,
+        });
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      throw new Error(`Tray rebuild failed with exit code ${result.status}.`);
+    }
+    return;
+  }
   const subcommand = TRAY_COMMANDS[value];
   if (!subcommand) {
-    throw new Error(`Usage: control tray ${Object.keys(TRAY_COMMANDS).join("|")}`);
+    throw new Error(`Usage: control tray ${[...Object.keys(TRAY_COMMANDS), "rebuild"].join("|")}`);
   }
   const result = spawnSync(
     process.execPath,
@@ -1412,6 +1802,43 @@ async function handleNativeRedirect(action, value) {
   process.stdout.write(`${JSON.stringify(setNativeRedirect(value))}\n`);
 }
 
+// One action for "give me a working harness": install the CLI if it is absent,
+// then publish the routed models into its own documents. Kept behind an
+// explicit subcommand rather than folded into `apply`, because it installs a
+// third-party package and that must never be a side effect of something else.
+async function handleHarness(action) {
+  const { harnessSnapshotWithWeb, setupHarness } = await import("./dsh-install.mjs");
+  if (!action || action === "status") {
+    process.stdout.write(`${JSON.stringify(await harnessSnapshotWithWeb())}\n`);
+    return;
+  }
+  if (action === "web") {
+    const { dshWebState } = await import("./dsh-web.mjs");
+    process.stdout.write(`${JSON.stringify(await dshWebState())}\n`);
+    return;
+  }
+  if (action === "start") {
+    const { startDshWeb } = await import("./dsh-web.mjs");
+    process.stdout.write(`${JSON.stringify(await startDshWeb())}\n`);
+    return;
+  }
+  if (action === "stop") {
+    const { stopDshWeb } = await import("./dsh-web.mjs");
+    process.stdout.write(`${JSON.stringify(await stopDshWeb())}\n`);
+    return;
+  }
+  if (action === "disconnect" || action === "off") {
+    const { disconnectHarness } = await import("./dsh-install.mjs");
+    process.stdout.write(`${JSON.stringify(await disconnectHarness())}\n`);
+    return;
+  }
+  if (action !== "setup" && action !== "install") {
+    throw new Error("Usage: control harness status|setup|start|stop|web|disconnect");
+  }
+  const result = await setupHarness();
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+}
+
 async function handlePresence(action, value) {
   const { PRESENCE_MODES, presenceSnapshot, setPresenceMode } = await import(
     "./presence-state.mjs"
@@ -1434,9 +1861,9 @@ if (args.includes("--probe")) {
   await emitProbeSet(args[1], args[2]);
 } else if (args[0] === "set") {
   if (!args[1] || !args[2]) throw new Error("Usage: control set <provider> <on|off> [--targets ...]");
-  runSet(args[1], args[2]);
+  await runSet(args[1], args[2]);
 } else if (args[0] === "apply") {
-  runApply();
+  await runApply();
 } else if (args[0] === "account") {
   await printAccountUsage();
 } else if (args[0] === "provider-usage") {
@@ -1463,7 +1890,9 @@ if (args.includes("--probe")) {
 } else if (args[0] === "model-set") {
   await setLoginFreeModel(args[1]);
 } else if (args[0] === "subagents") {
-  await handleSubagents(args[1], args[2], args[3]);
+  await handleSubagents(args[1], args[2], args[3], args.slice(2));
+} else if (args[0] === "tool-result-aging") {
+  await handleToolResultAging(args[1], args[2]);
 } else if (args[0] === "local-models") {
   await handleLocalModels(args[1], args[2], ...args.slice(3));
 } else if (args[0] === "vision-bridge") {
@@ -1476,6 +1905,8 @@ if (args.includes("--probe")) {
   await handleNativeRedirect(args[1], args[2]);
 } else if (args[0] === "tray") {
   handleTray(args[1]);
+} else if (args[0] === "harness") {
+  await handleHarness(args[1]);
 } else if (args[0] === "presence") {
   await handlePresence(args[1], args[2]);
 } else if (args[0] === "maintenance") {
@@ -1483,5 +1914,5 @@ if (args.includes("--probe")) {
 } else if (args[0] === "doctor") {
   runDoctor(args.slice(1));
 } else {
-  printOverview(args.includes("--json"));
+  await printOverview(args.includes("--json"));
 }

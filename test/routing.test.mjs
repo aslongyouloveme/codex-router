@@ -500,6 +500,101 @@ test("router dispatches aliased native slugs to the mapped external model", asyn
   }
 });
 
+test("native tool-result aging is opt-in and rewrites only consumed old results", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push({ url: request.url, body: await bodyJson(request) });
+    json(response, 200, { route: "native" });
+  });
+
+  // A conversation whose first tool result is large, already acted on, and
+  // outside the four-newest frontier — exactly the shape aging compacts.
+  const bigOutput = "x".repeat(40_000);
+  const agableInput = [
+    { type: "function_call", call_id: "call-old", name: "shell", arguments: "{}" },
+    { type: "function_call_output", call_id: "call-old", output: bigOutput },
+    {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "acted on it" }],
+    },
+    ...[1, 2, 3, 4].map((n) => ({
+      type: "function_call_output",
+      call_id: `call-${n}`,
+      output: `small result ${n}`,
+    })),
+  ];
+  const send = async (routerPort) =>
+    fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: agableInput }),
+    });
+
+  // Default state: the native path forwards the blob untouched.
+  const defaultPort = await openPort();
+  const defaultRouter = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(defaultPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  try {
+    await waitFor(`${routerBase(defaultPort)}/models`, defaultRouter);
+    assert.equal((await send(defaultPort)).status, 200);
+    assert.equal(nativeRequests.at(-1).body.input[1].output, bigOutput);
+  } finally {
+    await stopChild(defaultRouter);
+  }
+
+  // Opted in: the blob becomes a receipt, the newest results stay intact,
+  // and the usage event records the savings.
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "native-aging-state-"));
+  writeFileSync(
+    path.join(stateDir, "tool-result-aging.json"),
+    `${JSON.stringify({ version: 1, enabled: true, nativeEnabled: true })}\n`,
+    "utf8",
+  );
+  const agingPort = await openPort();
+  const agingRouter = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(agingPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_QUIET: "1",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+  });
+  try {
+    await waitFor(`${routerBase(agingPort)}/models`, agingRouter);
+    assert.equal((await send(agingPort)).status, 200);
+    const forwarded = nativeRequests.at(-1).body.input;
+    assert.match(forwarded[1].output, /^\[Older tool result compacted by Codex Router/);
+    assert.match(forwarded[1].output, /sha256:[0-9a-f]{64}/);
+    assert.equal(forwarded.at(-1).output, "small result 4");
+    // The usage event is appended after the response is relayed; give the
+    // router a moment to flush it rather than racing the write.
+    const eventsPath = path.join(stateDir, "usage-events.jsonl");
+    let aged;
+    const deadline = Date.now() + 3_000;
+    while (!aged && Date.now() < deadline) {
+      if (existsSync(eventsPath)) {
+        aged = readFileSync(eventsPath, "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+          .find((event) => event.toolResultsAged);
+      }
+      if (!aged) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(aged?.toolResultsAged, 1);
+    assert.ok(aged.toolResultBytesSaved > 30_000);
+  } finally {
+    await stopChild(agingRouter);
+    rmSync(stateDir, { recursive: true, force: true });
+    native.server.close();
+  }
+});
+
 test("router preserves native auth and isolates every external route", async () => {
   const nativeRequests = [];
   const routedRequests = [];
@@ -2493,6 +2588,7 @@ test("API forwarder routes Qwen plan models without unsupported parameters", asy
       ["qwen-plan-qwen3-8-max-preview", "qwen3.8-max-preview", undefined],
       ["qwen-plan-qwen3-6-flash", "qwen3.6-flash", undefined],
       ["qwen-plan-deepseek-v4-pro", "deepseek-v4-pro", "high"],
+      ["qwen-plan-deepseek-v4-pro-0813", "deepseek-v4-pro-0813", "high"],
       ["qwen-plan-deepseek-v4-flash-0731", "deepseek-v4-flash-0731", "high"],
       ["qwen-plan-glm-5-2", "glm-5.2", "high"],
     ]) {
@@ -2779,12 +2875,21 @@ test("API forwarder routes GLM coding-plan models with thinking enabled", async 
     await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
       Authorization: `Bearer ${INTERNAL_KEY}`,
     });
-    // GLM-5.2 has two documented tiers (high/max, upstream default max), so
-    // high must be sent explicitly; GLM-5-Turbo does not support the
-    // parameter and never receives it.
+    // Each entry is clamped onto the tiers Z.ai documents for that model.
+    // GLM-5.2 has two (high/max, upstream default max), so high must be sent
+    // explicitly and anything under it lands on high. GLM-5.3 adds a low tier,
+    // so low must survive instead of being rounded up to high. GLM-5-Turbo
+    // does not support the parameter and never receives it.
     for (const [gatewayModel, upstreamModel, sentEffort, expectedEffort] of [
       ["zai-coding-glm-5-2", "glm-5.2", "xhigh", "max"],
       ["zai-coding-glm-5-2", "glm-5.2", "high", "high"],
+      ["zai-coding-glm-5-2", "glm-5.2", "low", "high"],
+      ["zai-coding-glm-5-3", "glm-5.3", "minimal", "low"],
+      ["zai-coding-glm-5-3", "glm-5.3", "low", "low"],
+      ["zai-coding-glm-5-3", "glm-5.3", "medium", "low"],
+      ["zai-coding-glm-5-3", "glm-5.3", "high", "high"],
+      ["zai-coding-glm-5-3", "glm-5.3", "max", "max"],
+      ["zai-coding-glm-5-3-1m", "glm-5.3[1m]", "xhigh", "max"],
       ["zai-coding-glm-5-turbo", "glm-5-turbo", "low", undefined],
     ]) {
       const response = await fetch(
@@ -2816,6 +2921,63 @@ test("API forwarder routes GLM coding-plan models with thinking enabled", async 
       assert.equal(request.body.reasoning_effort, expectedEffort);
       assert.equal(request.body.temperature, undefined);
       assert.equal(request.body.top_p, undefined);
+    }
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+  }
+});
+
+test("API forwarder bills the Z.ai platform on its own endpoint and key", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push({ url: request.url, headers: request.headers, body: await bodyJson(request) });
+    json(response, 200, { choices: [] });
+  });
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    ZAI_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
+    ZAI_PLATFORM_API_KEY: "TEST_ZAI_PLATFORM_KEY",
+    // The Coding Plan variable is deliberately set too: the metered platform
+    // is a separate product with a separate credential, so a plan key must
+    // never authenticate a pay-per-token turn.
+    ZAI_API_KEY: "TEST_ZAI_CODING_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    // GLM-5.3 carries the documented low tier; GLM-4.7 has no documented
+    // effort ladder at all and must never receive the parameter.
+    for (const [gatewayModel, upstreamModel, sentEffort, expectedEffort] of [
+      ["zai-api-glm-5-3", "glm-5.3", "low", "low"],
+      ["zai-api-glm-5-2", "glm-5.2", "low", "high"],
+      ["zai-api-glm-4-7", "glm-4.7", "high", undefined],
+    ]) {
+      const response = await fetch(
+        `http://127.0.0.1:${forwarderPort}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${INTERNAL_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: gatewayModel,
+            reasoning_effort: sentEffort,
+            messages: [{ role: "user", content: "test" }],
+          }),
+        },
+      );
+      assert.equal(response.status, 200);
+      const request = upstreamRequests.at(-1);
+      assert.equal(request.headers.authorization, "Bearer TEST_ZAI_PLATFORM_KEY");
+      assert.equal(request.body.model, upstreamModel);
+      assert.deepEqual(request.body.thinking, { type: "enabled" });
+      assert.equal(request.body.reasoning_effort, expectedEffort);
     }
   } finally {
     await stopChild(forwarder);
@@ -3983,6 +4145,12 @@ test("router ages consumed large tool results but preserves the newest result fr
     json(response, 200, { output: [{ type: "message", role: "assistant", content: "ok" }] });
   });
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-tool-result-aging-"));
+  // Aging is opt-in, so this test states the setting it is exercising rather
+  // than relying on a default.
+  writeFileSync(
+    path.join(stateDir, "tool-result-aging.json"),
+    JSON.stringify({ version: 1, enabled: true, nativeEnabled: false }),
+  );
   const routerPort = await openPort();
   const router = run("router.mjs", {
     CODEX_ROUTER_PORT: String(routerPort),
@@ -4028,6 +4196,24 @@ test("router ages consumed large tool results but preserves the newest result fr
     const [event] = await waitForUsageEvents(stateDir, 1, router);
     assert.equal(event.toolResultsAged, 1);
     assert.ok(event.toolResultBytesSaved > 30_000);
+
+    // Settings are read for each routed request, so a UI toggle takes effect
+    // without restarting the router or interrupting a running Codex task.
+    writeFileSync(
+      path.join(stateDir, "tool-result-aging.json"),
+      `${JSON.stringify({ version: 1, enabled: false })}\n`,
+      { mode: 0o600 },
+    );
+    const exactResponse = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, input }),
+    });
+    assert.equal(exactResponse.status, 200, await exactResponse.text());
+    assert.equal(gatewayBodies[1].input[1].output, large);
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -4314,5 +4500,102 @@ test("a turn with no image reaches a text-only model untouched", async () => {
     await stopChild(router);
     await closeServer(gateway.server);
     await closeServer(native.server);
+  }
+});
+
+test("a live child turn settles an experimental subagent's proof", async () => {
+  const proofsPath = path.join(
+    mkdtempSync(path.join(os.tmpdir(), "subagent-proofs-e2e-")),
+    "multi-agent-proofs.json",
+  );
+  // Three models in the experimental window: one will prove itself, one will
+  // be rejected structurally, one completes a turn that carries no subagent
+  // marker and must stay untouched.
+  writeFileSync(
+    proofsPath,
+    JSON.stringify({
+      version: 1,
+      proofs: {
+        "deepseek/deepseek-v4-pro": { status: "experimental" },
+        "deepseek/deepseek-v4-flash": { status: "experimental" },
+        "deepseek/deepseek-chat": { status: "experimental" },
+      },
+    }),
+    { mode: 0o600 },
+  );
+  const gateway = await mockServer(async (request, response) => {
+    if (request.url === "/health") {
+      json(response, 200, { ok: true });
+      return;
+    }
+    const body = await bodyJson(request);
+    if (String(body.model || "").includes("flash")) {
+      json(response, 400, { error: { message: "encrypted payload rejected" } });
+      return;
+    }
+    json(response, 200, {
+      id: "resp_child",
+      output: [
+        { type: "message", content: [{ type: "output_text", text: "child done" }] },
+      ],
+      usage: { input_tokens: 12, output_tokens: 3 },
+    });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    MODEL_ROUTER_SUBAGENT_PROOFS: proofsPath,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  const childTurn = (model, headers = {}) =>
+    fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({ model, input: "finish the task" }),
+    });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+
+    // A clean completion of a marked child turn is the durable proof.
+    const proven = await childTurn("deepseek/deepseek-v4-pro", {
+      "x-openai-subagent": "review-child",
+    });
+    assert.equal(proven.status, 200);
+
+    // A structural rejection of a marked child turn is the demotion.
+    const rejected = await childTurn("deepseek/deepseek-v4-flash", {
+      "x-openai-subagent": "review-child",
+    });
+    assert.equal(rejected.status, 400);
+
+    // The same success without the subagent marker proves nothing.
+    const unmarked = await childTurn("deepseek/deepseek-chat");
+    assert.equal(unmarked.status, 200);
+
+    const deadline = Date.now() + 3_000;
+    let proofs;
+    while (Date.now() < deadline) {
+      proofs = JSON.parse(readFileSync(proofsPath, "utf8")).proofs;
+      if (
+        proofs["deepseek/deepseek-v4-pro"].status === "proven" &&
+        proofs["deepseek/deepseek-v4-flash"].status === "failed"
+      ) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(proofs["deepseek/deepseek-v4-pro"].status, "proven");
+    assert.equal(proofs["deepseek/deepseek-v4-flash"].status, "failed");
+    assert.match(proofs["deepseek/deepseek-v4-flash"].reason, /400/);
+    assert.equal(proofs["deepseek/deepseek-chat"].status, "experimental");
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
   }
 });

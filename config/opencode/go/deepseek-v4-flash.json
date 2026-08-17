@@ -11,7 +11,7 @@
       "description": "DeepSeek V4 Flash through the opencode Go subscription.",
       "priority": 37,
       "defaultEffort": "high",
-      "requestProfile": "deepseek-force-max",
+      "requestProfile": "deepseek-force-max-auto-tool-choice",
       "reasoningLevels": [
         {
           "effort": "low",
@@ -34,7 +34,7 @@
       "searchTool": {
         "mode": "standalone"
       },
-      "compHash": "opencode-go-deepseek-v4-flash-v2"
+      "compHash": "opencode-go-deepseek-v4-flash-v3"
     }
   ]
 }

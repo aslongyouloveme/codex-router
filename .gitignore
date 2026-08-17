@@ -1,7 +1,7 @@
 .DS_Store
 .venv/
 .build/
-node_modules/
+node_modules
 dist/
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
@@ -15,3 +15,6 @@ apps/desktop/src-tauri/icons/icon.icns
 *.tmp
 .idea/
 Codex_Router_CommandCode_Proxy_运维记录.docx
+.electron-shots/
+release/
+generated/

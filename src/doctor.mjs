@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { validCallerSecret } from "./caller-auth.mjs";
 import { codexAuthStatus, findCodexBinary, runCodex } from "./codex-binary.mjs";
+import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
 import { routedCodexAgentStatus } from "./codex-agent-catalog.mjs";
 import { privateFileIsProtected } from "./file-security.mjs";
 import { grokCliPreflight } from "./grok-cli.mjs";
@@ -24,6 +25,8 @@ import {
   CODEX_AGENTS_DIR,
   CODEX_HOME,
   CONFIG_PATH,
+  DSH_CATALOG_PATH,
+  DSH_SETTINGS_PATH,
   INTERNAL_SECRET_PATH,
   LITELLM_CONFIG_PATH,
   MERGED_CATALOG_PATH,
@@ -37,6 +40,7 @@ import {
   skillRequiredFields,
 } from "./skills-install.mjs";
 import { cliSessionDescriptor } from "./cli-session-credential.mjs";
+import { discoveryDisabled } from "./discovery-mode.mjs";
 import { credentialLabel, credentialStatus } from "./provider-credentials.mjs";
 import { providerNeedsCuration } from "./provider-onboarding.mjs";
 import { stateOwnershipStatus } from "./state-owner.mjs";
@@ -90,7 +94,16 @@ function bundledVenvProblem() {
 // says nothing here; only the load-error message does.
 function configLoadComplaint(binary, spawn) {
   try {
-    const result = spawn(binary, ["login", "status"], { encoding: "utf8", timeout: 10_000 });
+    // A .cmd shim needs the cmd.exe hop, or the probe dies before Codex is
+    // reached -- and a probe that never ran reports no complaint, which made
+    // this check silently pass on every npm-installed Windows Codex.
+    const target = spawnableCommand(binary, ["login", "status"]);
+    const result = spawn(target.command, target.args, {
+      ...target.options,
+      encoding: "utf8",
+      timeout: 10_000,
+      windowsHide: true,
+    });
     if (result.error) return undefined;
     return `${result.stdout || ""}\n${result.stderr || ""}`
       .split(/\r?\n/)
@@ -111,6 +124,10 @@ export function codexConfigLoadError({
   spawn = spawnSync,
   binaries = [findCodexBinary(), commandOnPath("codex")],
 } = {}) {
+  // The probe is `codex login status` against the user's real CODEX_HOME, and
+  // Codex reads its session file to answer it. --no-discovery promises that
+  // read never happens, so the config-load check goes unanswered in idle mode.
+  if (discoveryDisabled()) return undefined;
   const seen = new Set();
   for (const binary of binaries) {
     if (!binary || seen.has(binary)) continue;
@@ -121,18 +138,6 @@ export function codexConfigLoadError({
   return undefined;
 }
 
-function commandOnPath(name) {
-  try {
-    return execFileSync(process.platform === "win32" ? "where.exe" : "which", [name], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .trim()
-      .split(/\r?\n/)[0];
-  } catch {
-    return undefined;
-  }
-}
 
 function readableSecret(target, validator) {
   if (!existsSync(target)) return false;
@@ -270,51 +275,64 @@ add(
   "Use macOS, Windows, or Linux with the Codex CLI.",
 );
 
-const codex = findCodexBinary();
-add(
-  codex ? "ok" : "fail",
-  "Codex binary",
-  codex || "not found",
-  "Install Codex or set CODEX_BIN to the Codex CLI binary.",
-);
+// Everything from here to the routing-config check describes the *client* this
+// command was invoked for. The shared router plane below it is checked the
+// same way whichever integration asked, because it is the same plane.
+const codexTarget = TARGET === "codex";
+const codex = codexTarget ? findCodexBinary() : undefined;
+if (codexTarget) {
+  add(
+    codex ? "ok" : "fail",
+    "Codex binary",
+    codex || "not found",
+    "Install Codex or set CODEX_BIN to the Codex CLI binary.",
+  );
+}
 // A Codex binary that cannot be spawned reads as "signed out" everywhere it is
 // probed, which silently removes every native model from the picker. Surface it
 // as its own failure instead of letting it masquerade as a logged-out session.
-const codexAuth = codexAuthStatus();
-add(
-  codexAuth.reason === "probe-failed" ? "fail" : "ok",
-  "Codex sign-in probe",
-  codexAuth.reason === "probe-failed"
-    ? `could not run ${codexAuth.binary} (${codexAuth.code || "spawn failed"})`
-    : codexAuth.reason,
-  "Set CODEX_BIN to a Codex CLI Node can spawn; on Windows use the codex.cmd shim, not the extensionless one.",
-);
-add(
-  existsSync(CONFIG_PATH) ? "ok" : "fail",
-  "Codex config",
-  CONFIG_PATH,
-  "Start Codex once, then run ./bin/doctor --fix.",
-);
+const codexAuth = codexTarget ? codexAuthStatus() : undefined;
+if (codexTarget) {
+  add(
+    codexAuth.reason === "probe-failed" ? "fail" : "ok",
+    "Codex sign-in probe",
+    codexAuth.reason === "probe-failed"
+      ? `could not run ${codexAuth.binary} (${codexAuth.code || "spawn failed"})`
+      : codexAuth.reason,
+    "Set CODEX_BIN to a Codex CLI Node can spawn; on Windows use the codex.cmd shim, not the extensionless one.",
+  );
+  add(
+    existsSync(CONFIG_PATH) ? "ok" : "fail",
+    "Codex config",
+    CONFIG_PATH,
+    "Start Codex once, then run ./bin/doctor --fix.",
+  );
+}
 // Every other check here can pass while Codex refuses to start, because a
 // single unparseable key aborts the whole config load -- no models, native or
 // routed. Codex's own loader is the only authority on that, and its error
 // names the file, line, and column, so it is worth quoting verbatim.
-const configLoad = codexConfigLoadError();
-add(
-  configLoad ? "fail" : "ok",
-  "Codex config loads",
-  configLoad || "Codex parses its configuration",
-  configLoad
-    ? "Codex cannot start until this line is fixed or removed; the message above names the file and line."
-    : undefined,
-);
-const configMode = existsSync(CONFIG_PATH)
-  ? statSync(CONFIG_PATH).mode & 0o777
+const configLoad = codexTarget ? codexConfigLoadError() : undefined;
+if (codexTarget) {
+  add(
+    configLoad ? "fail" : "ok",
+    "Codex config loads",
+    configLoad || "Codex parses its configuration",
+    configLoad
+      ? "Codex cannot start until this line is fixed or removed; the message above names the file and line."
+      : undefined,
+  );
+}
+// Both clients hold the managed base URL, which is a local caller capability,
+// so both documents are held to the same privacy bound.
+const privacyTarget = codexTarget ? CONFIG_PATH : DSH_SETTINGS_PATH;
+const configMode = existsSync(privacyTarget)
+  ? statSync(privacyTarget).mode & 0o777
   : undefined;
-const configProtected = privateFileIsProtected(CONFIG_PATH);
+const configProtected = privateFileIsProtected(privacyTarget);
 add(
   configProtected ? "ok" : "fail",
-  "Codex config privacy",
+  codexTarget ? "Codex config privacy" : "Harness settings privacy",
   configMode === undefined
     ? "missing"
     : process.platform === "win32"
@@ -327,21 +345,36 @@ let selection = { providers: [], explicit: false };
 let requiredRoutedModels = [];
 let catalogRoutedModels = [];
 let requiredModels = new Set();
-const routedTransportActive = routedCatalogConfigured(
-  existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "",
-);
+// "Is routed traffic actually reaching the gateway?" has a different witness
+// per client: Codex's managed config block, and the harness's published route
+// snapshot. Reading Codex's config for a harness install reported every routed
+// model as unoffered on a machine that has no Codex at all.
+const routedTransportActive = codexTarget
+  ? routedCatalogConfigured(existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "")
+  : existsSync(DSH_CATALOG_PATH);
+// An install made with --no-provider --no-discovery is idle on purpose: the
+// selection is an explicit empty list and the discovery marker is set. That
+// state is what the operator asked for, so the empty selection and the empty
+// catalog report at warn/ok -- the precedent is serviceStoppedByDesign below.
+let idleInstall = false;
 try {
   selection = providerSelectionStatus();
+  idleInstall =
+    selection.explicit && selection.providers.length === 0 && discoveryDisabled();
   requiredRoutedModels = selectedConfiguredListedModels();
   catalogRoutedModels = routedTransportActive ? requiredRoutedModels : [];
   requiredModels = new Set(catalogRoutedModels.map((model) => model.slug));
   add(
-    selection.providers.length ? "ok" : "fail",
+    selection.providers.length ? "ok" : idleInstall ? "warn" : "fail",
     "Enabled providers",
     selection.providers.length
       ? `${selection.providers.join(", ")}${selection.explicit ? "" : " (legacy show-all mode)"}`
-      : "none",
-    "Run ./bin/setup --guided and choose at least one provider.",
+      : idleInstall
+        ? "none (idle install: --no-provider)"
+        : "none",
+    idleInstall
+      ? "Run ./bin/setup without --no-provider to enable a provider."
+      : "Run ./bin/setup --guided and choose at least one provider.",
   );
   // The router no longer refuses to serve on a selection file it cannot fully
   // resolve, so the damage has to be reported here instead of as a 502.
@@ -375,17 +408,24 @@ try {
 }
 const catalogOk =
   catalogReadable &&
-  (routedTransportActive
+  (routedTransportActive && !idleInstall
     ? requiredModels.size > 0 &&
       [...requiredModels].every((slug) => catalogModels.some((model) => model.slug === slug))
     : !catalogModels.some((model) => MODEL_BY_SLUG.has(String(model.slug))));
-add(
+// The merged catalog is the file Codex reads. A harness install has no
+// equivalent: its offer is the settings route, checked by "Harness routing
+// config" below. An idle install deliberately publishes no routed models, so
+// its catalog is held to the same standard as inactive transport: nothing
+// routable may be offered.
+if (codexTarget) add(
   catalogOk ? "ok" : "fail",
   "Merged catalog",
   catalogOk
-    ? routedTransportActive
-      ? `${requiredModels.size} routed models`
-      : "native-only; routed transport is inactive"
+    ? idleInstall
+      ? "idle install; no routed models"
+      : routedTransportActive
+        ? `${requiredModels.size} routed models`
+        : "native-only; routed transport is inactive"
     : MERGED_CATALOG_PATH,
   "Run ./bin/refresh-catalog, or ./bin/doctor --fix if files are missing.",
 );
@@ -465,10 +505,13 @@ if (visionSettings.enabled && !visionEngine) {
 }
 // The same list the catalog writes definitions from, so a model switched off
 // as a subagent is expected to have no definition rather than a missing one.
-const agentStatus = routedCodexAgentStatus(
-  subagentEligibleModels(catalogRoutedModels, readMultiAgentSettings()),
-);
-add(
+// Codex-only: these are files in Codex's own agents directory, and the harness
+// spawns children through `dsh-tool-subagent` instead
+// (`./bin/model-router dsh subagent-preset`).
+const agentStatus = codexTarget
+  ? routedCodexAgentStatus(subagentEligibleModels(catalogRoutedModels, readMultiAgentSettings()))
+  : undefined;
+if (codexTarget) add(
   agentStatus.ok ? "ok" : "fail",
   "Routed model agents",
   agentStatus.ok
@@ -483,13 +526,11 @@ add(
   "Dynamic subagent models",
   (() => {
     const settings = readMultiAgentSettings();
-    if (settings.mode === "all") return "all selected models exposed as v2 spawn agents";
-    if (settings.mode === "selected") {
-      return `${settings.enabled.length} selected model(s) exposed as v2 spawn agents`;
-    }
-    return "only registry-proven v2 models";
+    return settings.disabled.length
+      ? `registry-proven v2 models except ${settings.disabled.length} disabled model(s)`
+      : "only registry-proven v2 models";
   })(),
-  "Run ./bin/multi-agent on to expose every selected model as a subagent.",
+  "Complete the native collaboration proof before adding multiAgentVersion v2 to a model.",
 );
 add(
   "ok",
@@ -582,40 +623,65 @@ add(
   "Run ./bin/doctor --fix; this capability is generated locally and is not a provider key.",
 );
 
-const kimiHealth = kimiOAuthHealth();
-const kimiSelected = selection.providers.includes("kimi-oauth");
-// An expired access token is a normal, recoverable state: the request path
-// refreshes it with the still-valid refresh token before forwarding, so it
-// must not read as a failure here. Every unusable state fails when Kimi OAuth
-// is selected; an unselected provider is advisory regardless of credential
-// health.
-const kimiStatus = !kimiSelected
-  ? "warn"
-  : kimiHealth.status === "ok" || kimiHealth.status === "stale"
-    ? "ok"
-    : "fail";
-add(
-  kimiStatus,
-  "Kimi OAuth",
-  kimiHealth.detail,
-  kimiHealth.fix,
-);
-const grokOauth = grokOAuthStatus();
-const grokCli = grokCliPreflight();
-const grokOauthReady = grokOauth.configured && grokCli.runnable;
-add(
-  grokOauthReady ? "ok" : selection.providers.includes("grok-oauth") ? "fail" : "warn",
-  "Grok OAuth",
-  !grokCli.runnable
-    ? grokCli.detail
-    : grokOauth.configured
-      ? grokOauth.source
-      : `not configured; ${grokOauth.setup}`,
-  !grokCli.runnable ? grokCli.fix : "Run grok login, then rerun the doctor.",
-);
+// Per-provider credential rows are themselves discovery: each one resolves the
+// provider's credential. Under --no-discovery the resolvers answer nothing by
+// design, so 26 rows of "not configured" would report the guard's output as
+// though it were the machine's state. One row says what is actually true.
+const credentialDiscoveryOff = discoveryDisabled();
+if (credentialDiscoveryOff) {
+  add(
+    "warn",
+    "Credential discovery",
+    "disabled (--no-discovery); provider credentials, the Keychain, and other CLIs' sessions are not read",
+    "Re-run ./bin/setup without --no-discovery to re-enable it.",
+  );
+  const listenHost = process.env.CODEX_ROUTER_HOST || process.env.KIMI_ROUTER_HOST;
+  if (listenHost && !["127.0.0.1", "localhost", "::1"].includes(listenHost)) {
+    add(
+      "warn",
+      "Router listen host",
+      `${listenHost} (an idle install is expected to stay loopback-only)`,
+      "Unset CODEX_ROUTER_HOST / KIMI_ROUTER_HOST to bind 127.0.0.1.",
+    );
+  }
+}
+if (!credentialDiscoveryOff) {
+  const kimiHealth = kimiOAuthHealth();
+  const kimiSelected = selection.providers.includes("kimi-oauth");
+  // An expired access token is a normal, recoverable state: the request path
+  // refreshes it with the still-valid refresh token before forwarding, so it
+  // must not read as a failure here. Every unusable state fails when Kimi OAuth
+  // is selected; an unselected provider is advisory regardless of credential
+  // health.
+  const kimiStatus = !kimiSelected
+    ? "warn"
+    : kimiHealth.status === "ok" || kimiHealth.status === "stale"
+      ? "ok"
+      : "fail";
+  add(
+    kimiStatus,
+    "Kimi OAuth",
+    kimiHealth.detail,
+    kimiHealth.fix,
+  );
+  const grokOauth = grokOAuthStatus();
+  const grokCli = grokCliPreflight();
+  const grokOauthReady = grokOauth.configured && grokCli.runnable;
+  add(
+    grokOauthReady ? "ok" : selection.providers.includes("grok-oauth") ? "fail" : "warn",
+    "Grok OAuth",
+    !grokCli.runnable
+      ? grokCli.detail
+      : grokOauth.configured
+        ? grokOauth.source
+        : `not configured; ${grokOauth.setup}`,
+    !grokCli.runnable ? grokCli.fix : "Run grok login, then rerun the doctor.",
+  );
+}
 
 for (const provider of PROVIDERS.values()) {
   if (provider.kind !== "openai-compatible") continue;
+  if (credentialDiscoveryOff) continue;
   const status = credentialStatus(provider, { persistent: true });
   const session = cliSessionDescriptor(provider);
   const credentialType = credentialLabel(provider);
@@ -627,10 +693,16 @@ for (const provider of PROVIDERS.values()) {
     status.configured ? "ok" : selection.providers.includes(provider.id) ? "fail" : "warn",
     provider.keyless
       ? `${provider.displayName} endpoint`
+      : provider.authMode === "anonymous"
+        ? `${provider.displayName} anonymous endpoint`
       : `${provider.displayName} ${credentialNoun}`,
     status.configured ? status.source : "not configured",
     provider.keyless
-      ? "Start Ollama, then run ./bin/control local-models list."
+      ? provider.id === "local"
+        ? "Start Ollama, then run ./bin/control local-models list."
+        : `Start ${provider.displayName}, then run ./bin/curate-models ${provider.id}.`
+      : provider.authMode === "anonymous"
+        ? provider.anonymousNote || "No key needed; only the provider's free models are available."
       : session
         ? `Run ${session.loginCommand}, or ./bin/provider-key ${provider.id} set.`
         : `Run ./bin/provider-key ${provider.id} set.`,
@@ -650,17 +722,58 @@ for (const provider of PROVIDERS.values()) {
       `${provider.displayName} models`,
       provider.keyless
         ? "no local models are checked, so the picker stays empty"
+        : provider.authMode === "anonymous"
+          ? `${provider.displayName} is ready; discover and curate its current free models`
         : `${credentialNoun} stored but no models curated; the picker stays empty`,
-      // Local models are downloaded and checked, never curated from a remote
-      // catalog, so naming `curate-models` here points at the wrong command.
+      // Ollama models are downloaded and checked locally; other keyless local
+      // providers use the generic live catalog curation path.
       provider.keyless
-        ? `Install one with ./bin/control local-models install <tag-or-url> --yes; tool-capable models are checked automatically.`
+        ? provider.id === "local"
+          ? `Install one with ./bin/control local-models install <tag-or-url> --yes; tool-capable models are checked automatically.`
+          : `Run ./bin/curate-models ${provider.id} in an interactive terminal.`
         : `Run ./bin/curate-models ${provider.id} in an interactive terminal.`,
     );
   }
 }
 
-try {
+if (TARGET === "dsh") {
+  try {
+    const dsh = childJson("dsh-config-manager.mjs", ["status"]);
+    add(
+      dsh.routeInstalled ? "ok" : "fail",
+      "Harness routing config",
+      dsh.routeInstalled
+        ? `llm-pi-ai.providers.${dsh.route} in ${dsh.settings}`
+        : dsh.structureError || `no ${dsh.route} route in ${dsh.settings}`,
+      "Run ./bin/model-router dsh enable.",
+    );
+    add(
+      dsh.credentialInstalled ? "ok" : "fail",
+      "Harness caller credential",
+      dsh.credentialInstalled
+        ? `stored in ${dsh.credentials}`
+        : `missing from ${dsh.credentials}`,
+      "Run ./bin/model-router dsh enable; the route resolves its key by reference, so an absent value fails every request.",
+    );
+    // Drift is the failure mode this integration has that Codex's does not:
+    // the harness hot-reloads its settings document, so anything else that
+    // writes it -- the Models page, a hand edit -- takes effect at once and can
+    // leave the published route naming models the gateway no longer routes.
+    add(
+      dsh.publishedModels === dsh.routableModels ? "ok" : "warn",
+      "Harness catalog freshness",
+      `published ${dsh.publishedModels}, routable ${dsh.routableModels}`,
+      "Run ./bin/model-router dsh enable to republish.",
+    );
+  } catch (error) {
+    add(
+      "fail",
+      "Harness routing config",
+      error instanceof Error ? error.message : String(error),
+      "Inspect $DSH_HOME/settings.yaml, then run ./bin/model-router dsh enable.",
+    );
+  }
+} else try {
   const config = childJson("config-manager.mjs", ["status"]);
   add(
     config.mode === "router" ? "ok" : "fail",
@@ -726,6 +839,27 @@ add(
 // must not read as a failure: a `fail` here sets the exit code and sends the
 // tray's Fix button down the full repair path for a router that is off on
 // purpose.
+// A ChatGPT session the router can no longer spend is not a router fault, but
+// it is why native models stop appearing in the harness -- and it is fixed by
+// opening Codex, which nothing else would tell the user.
+try {
+  const { nativeSessionStatus } = await import("./codex-native-session.mjs");
+  const session = nativeSessionStatus();
+  if (session.present && session.fallbackEnabled) {
+    const hours = session.expiresInHours;
+    add(
+      session.usable ? "ok" : "warn",
+      "Codex session for harness models",
+      session.usable
+        ? `valid${hours === undefined ? "" : ` for ${hours}h`}`
+        : "expired; open Codex once to renew it (native models are withheld until then)",
+      "Open Codex, or run `codex login`.",
+    );
+  }
+} catch {
+  // Never let a diagnostic be the thing that fails the doctor.
+}
+
 const followsHostApps = serviceFollowsHostApps();
 let serviceLoaded = false;
 let serviceStoppedByDesign = false;
@@ -764,8 +898,9 @@ add(
 
 // The skill pack that teaches custom routed models the native tools. Checks
 // are read-only; the fixes re-run ./bin/install, which refreshes exactly the
-// marker-owned directories.
-{
+// marker-owned directories. It lives in Codex's user-skill directory and
+// describes Codex's own tools, so it is not part of a harness install.
+if (codexTarget) {
   const status = skillPackStatus(CODEX_HOME);
   add(
     status.missing.length === 0 ? "ok" : "fail",
@@ -829,7 +964,18 @@ add(
   );
 }
 
-if (codex && catalogOk && routedTransportActive) {
+if (codex && catalogOk && routedTransportActive && credentialDiscoveryOff) {
+  // `debug models` without --bundled answers with the signed-in account's
+  // catalog, which a discovery-disabled install promised never to consult.
+  // The on-disk catalog was already verified above; the only thing skipped
+  // is the is-Codex-restarted staleness probe.
+  add(
+    "ok",
+    "Codex model catalog",
+    "on-disk catalog verified; the account-aware staleness probe is skipped while discovery is off",
+    "Re-enable discovery to restore the startup staleness check.",
+  );
+} else if (codex && catalogOk && routedTransportActive) {
   try {
     const parsed = JSON.parse(
       runCodex(["debug", "models"], {

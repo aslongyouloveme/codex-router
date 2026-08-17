@@ -13,7 +13,9 @@ import { promisify } from "node:util";
 import {
   assertCallerSecret,
   authenticatedRoute,
+  secretEqual,
 } from "./caller-auth.mjs";
+import { handlePanelRequest, isPanelRoute } from "./desktop-panel.mjs";
 import {
   applyKeepAliveTimeouts,
   endStreamedResponse,
@@ -24,6 +26,7 @@ import {
   pipeResponse,
   readRequestBody,
   writeJson,
+  writeStreamErrorEvent,
 } from "./http-utils.mjs";
 import { EmptyCompletionGuard } from "./empty-completion-guard.mjs";
 import {
@@ -34,6 +37,7 @@ import {
 } from "./paths.mjs";
 import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
 import { createHealthCache } from "./health-cache.mjs";
+import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
 import {
@@ -52,7 +56,15 @@ import {
   NamespaceToolCallTransform,
   flattenNamespacedHistory,
   flattenNamespaceTools,
+  repairToolSchemaRoots,
 } from "./namespace-relay.mjs";
+import { pendingInterruptTargets } from "./subagent-completion.mjs";
+import {
+  awaitingSpawnProof,
+  recordSpawnFailure,
+  recordSpawnObserved,
+  subagentProofSnapshot,
+} from "./subagent-proofs.mjs";
 import { mergeCodexAppTools } from "./codex-app-tools.mjs";
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
 import { translateGatewayError } from "./error-translation.mjs";
@@ -77,7 +89,15 @@ import { readHiddenModels } from "./model-picker-state.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { installedNativeVisionEngines } from "./vision-engines.mjs";
 import { ageToolResults } from "./tool-result-aging.mjs";
+import {
+  nativeToolResultAgingEnabled,
+  toolResultAgingEnabled,
+} from "./tool-result-aging-state.mjs";
 import { VERSION } from "./version.mjs";
+import { nativeSessionHeaders } from "./codex-native-session.mjs";
+import { installStableFetchTransport } from "./fetch-transport.mjs";
+
+installStableFetchTransport();
 
 const LISTEN_HOST =
   process.env.CODEX_ROUTER_HOST || process.env.KIMI_ROUTER_HOST || "127.0.0.1";
@@ -116,11 +136,6 @@ const QUIET =
 // operator who would rather see the provider's own numbers can turn it off
 // without downgrading the router.
 const ZERO_INPUT_ESTIMATE = process.env.CODEX_ROUTER_ZERO_INPUT_ESTIMATE !== "0";
-// Old large tool results are replayed to routed models on every later turn.
-// Compact only results the model has already acted on, while keeping the
-// newest result frontier intact. This never changes native OpenAI traffic and
-// can be disabled immediately if a provider or workload needs exact history.
-const TOOL_RESULT_AGING = process.env.CODEX_ROUTER_TOOL_RESULT_AGING !== "0";
 // Kill switch for the empty-completion guard and its single retry. It is on
 // because an empty completion is otherwise invisible -- the client records the
 // turn as a silent success -- but the retry re-sends the whole prompt, so an
@@ -355,7 +370,94 @@ function nativeHeaders(request) {
       headers[name] = Array.isArray(value) ? value.join(", ") : value;
     }
   }
+  // A caller that brought its own upstream session is relayed exactly as it
+  // arrived -- Codex always does, so nothing about a Codex turn changes here.
+  //
+  // "Brought none" is not the same as "sent no header". The harness
+  // authenticates to this router with the router's *own* caller key, as a
+  // bearer token, because a provider route has nowhere else to put a
+  // credential. That key means "you may use this router"; it is not an OpenAI
+  // credential, and forwarding it upstream earns exactly the "API key is
+  // invalid" it deserves -- besides handing a local secret to a remote host.
+  // So a router-local key counts as no upstream credential at all.
+  const presented = bearerToken(headers.authorization);
+  const routerLocal =
+    presented !== undefined &&
+    (secretEqual(presented, CALLER_KEY || "") || secretEqual(presented, INTERNAL_KEY || ""));
+  if (!headers.authorization || routerLocal) {
+    const fallback = nativeSessionHeaders();
+    if (fallback) {
+      Object.assign(headers, fallback);
+    } else if (routerLocal) {
+      // Nothing to substitute. Send no credential rather than this one: the
+      // upstream 401 is the same either way, and a router secret must never
+      // leave the machine.
+      delete headers.authorization;
+    }
+  }
   return headers;
+}
+
+// The token out of an `Authorization: Bearer <token>` header, or undefined for
+// any other scheme -- which is relayed untouched rather than inspected.
+//
+// Parsed rather than matched. `/^Bearer\s+(.+)$/` reads well and backtracks
+// polynomially on a header of many spaces and no token, and this runs on a
+// header an unauthenticated caller controls. Scanning is linear and needs no
+// reasoning about which quantifiers can overlap.
+const BEARER_PREFIX = "bearer";
+function bearerToken(value) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length <= BEARER_PREFIX.length) return undefined;
+  if (trimmed.slice(0, BEARER_PREFIX.length).toLowerCase() !== BEARER_PREFIX) return undefined;
+  // The scheme and the token must be separated by whitespace, or `BearerX` and
+  // `Bearer X` would parse the same.
+  const separator = trimmed[BEARER_PREFIX.length];
+  if (separator !== " " && separator !== "\t") return undefined;
+  const token = trimmed.slice(BEARER_PREFIX.length + 1).trim();
+  return token || undefined;
+}
+
+// True when the caller authenticated to this router and brought no upstream
+// credential of its own -- the harness, and anything else pointed at a managed
+// caller base URL. Codex is never this.
+function callerBroughtNoUpstreamCredential(request) {
+  const presented = bearerToken(request.headers.authorization);
+  if (presented === undefined) return request.headers.authorization === undefined;
+  return secretEqual(presented, CALLER_KEY || "") || secretEqual(presented, INTERNAL_KEY || "");
+}
+
+// ChatGPT's own backend accepts a narrower request than the public Responses
+// API does. Codex knows the difference and complies; a generic OpenAI client
+// does not, and every one of these comes back as a bare 400 that names a single
+// parameter. Measured against the live endpoint rather than guessed.
+const NATIVE_UNSUPPORTED_PARAMS = Object.freeze([
+  "temperature",
+  "top_p",
+  "presence_penalty",
+  "frequency_penalty",
+  "max_tokens",
+  "max_output_tokens",
+  "metadata",
+  "seed",
+  "user",
+  "truncation",
+]);
+
+/**
+ * Make a generic Responses request acceptable to the native endpoint.
+ *
+ * Applied only for a caller whose session this router substituted, so a Codex
+ * turn is never rewritten -- Codex sends a compliant request already, and the
+ * promise that its traffic is byte-identical is worth more than the tidiness of
+ * one shared path.
+ */
+function normalizeNativeForSubstitutedCaller(payload) {
+  // Not optional upstream: `store` must be false, and anything else is a 400.
+  payload.store = false;
+  for (const key of NATIVE_UNSUPPORTED_PARAMS) delete payload[key];
+  return payload;
 }
 
 function routedHeaders() {
@@ -373,7 +475,11 @@ function routedHeaders() {
 // can cause the upstream model to emit an invalid forced call.
 function normalizeAutoToolChoice(payload, route) {
   if (
-    ["auto-tool-choice", "ollama-cloud-auto-tool-choice"].includes(route.requestProfile) &&
+    [
+      "auto-tool-choice",
+      "ollama-cloud-auto-tool-choice",
+      "deepseek-force-max-auto-tool-choice",
+    ].includes(route.requestProfile) &&
     payload.tool_choice !== undefined &&
     payload.tool_choice !== "none"
   ) {
@@ -1404,7 +1510,7 @@ async function summarize(request, payload, route, signal) {
   // is cached by ciphertext, so a conversation whose turns already resolved
   // costs nothing extra here.
   const normalized = await normalizeRoutedAgentInput(request, originalInput, signal);
-  const aged = ageToolResults(normalized, { enabled: TOOL_RESULT_AGING });
+  const aged = ageToolResults(normalized, { enabled: toolResultAgingEnabled() });
   const bridged = await bridgeVisionInput(
     aged.input,
     route,
@@ -1577,6 +1683,56 @@ function requireCodexTransport(request, response) {
   return true;
 }
 
+// A model in the experimental subagent window earns its durable proof — or
+// its demotion — from real traffic: Codex marks child turns with
+// x-openai-subagent, so the first clean completion of one settles "this model
+// can hold the child role" without a dedicated probe session. Only structural
+// rejections demote (400/422, the shape a schema or encrypted-payload refusal
+// takes); transient failures — 429s, 5xx, disconnects — prove nothing either
+// way and leave the window open. Neither line is QUIET-gated: a promotion or
+// demotion that happens silently is how a picker entry becomes unexplainable.
+function observeSubagentOutcome(request, route, status, { emptyCompletion = false } = {}) {
+  if (!route) return;
+  try {
+    if (!request.headers["x-openai-subagent"]) return;
+    if (!awaitingSpawnProof(route.slug, subagentProofSnapshot())) return;
+    if (status === 200 && !emptyCompletion) {
+      recordSpawnObserved(route.slug, { status });
+      console.error(
+        `[codex-router] subagent proven: ${route.slug} completed a live child turn`,
+      );
+    } else if (status === 400 || status === 422) {
+      recordSpawnFailure(route.slug, {
+        status,
+        reason: `child turn rejected with HTTP ${status}`,
+      });
+      console.error(
+        `[codex-router] subagent demoted: ${route.slug} child turn rejected with HTTP ${status}; ` +
+          "it stays v1 until 'control subagents verify' passes again",
+      );
+    }
+  } catch {
+    // Observation is bookkeeping; it must never fail the turn it watched.
+  }
+}
+
+// The local answer an idle install gives instead of native forwarding. With
+// discovery disabled the native path is impossible by construction -- the
+// session fallback never reads auth.json -- so traffic that would leave for
+// chatgpt.com is refused before any upstream fetch, keeping the --no-discovery
+// promise that nothing leaves this machine.
+function writeIdleNoProviderError(response) {
+  writeJson(response, 503, {
+    error: {
+      type: "router_idle_no_provider",
+      message:
+        "This router was installed without providers and with credential discovery disabled " +
+        "(--no-provider --no-discovery), so no traffic leaves this machine. " +
+        "Re-run setup without those flags to enable a provider.",
+    },
+  });
+}
+
 async function handleResponses(request, response, requestUrl) {
   const startedAt = Date.now();
   const activity = beginRequestActivity();
@@ -1585,6 +1741,7 @@ async function handleResponses(request, response, requestUrl) {
   let route;
   let upstreamRetries;
   let upstreamLatencyMs;
+  let firstTokenMs;
   let usageTransform;
   let emptyCompletionGuard;
   let retryUsageTransform;
@@ -1593,8 +1750,14 @@ async function handleResponses(request, response, requestUrl) {
   let usage;
   let estimatedInputTokens;
   let toolResultAging;
+  let pendingInterrupts = [];
   let emptyCompletion = false;
   let emptyCompletionRetried = false;
+  // An empty turn the router could not repair because the attempt was already
+  // relayed. Distinct from `emptyCompletionRetried` in the meter: one is a
+  // failure the router absorbed, the other a failure it had to hand to the
+  // client, and only the second is visible to the user.
+  let emptyCompletionUnrepairable = false;
   let guardReleasedForBudget = false;
   let finalStatus;
   let activityStatus;
@@ -1631,6 +1794,13 @@ async function handleResponses(request, response, requestUrl) {
           message: `Provider ${registeredRoute.provider} is hidden. Run ./bin/providers enable ${registeredRoute.provider}.`,
         },
       });
+      return;
+    }
+    // Anything without a route from here on is native GPT traffic. An install
+    // that merely hid every provider keeps its native passthrough -- that has
+    // always worked -- but an idle --no-discovery install answers locally.
+    if (!route && discoveryDisabled()) {
+      writeIdleNoProviderError(response);
       return;
     }
     // Activity and usage attribute protocol variants to their canonical
@@ -1701,7 +1871,7 @@ async function handleResponses(request, response, requestUrl) {
         payload.input,
         controller.signal,
       );
-      const aged = ageToolResults(normalized, { enabled: TOOL_RESULT_AGING });
+      const aged = ageToolResults(normalized, { enabled: toolResultAgingEnabled() });
       toolResultAging = aged.stats;
       const input = await bridgeVisionInput(
         aged.input,
@@ -1745,6 +1915,12 @@ async function handleResponses(request, response, requestUrl) {
         // spawn_agent model enum off it to drop an invented or stale optional
         // override before Codex validates the call.
         flattenedNamespaces = flattenNamespaceTools(payload.tools).namespaces;
+        // Keeping the namespace shape is not the same as keeping a root the
+        // upstream rejects. `opencode-go-responses/gpt-5.6-luna` 400s a
+        // `type: ["object","null"]` parameter root while accepting the same
+        // request with a plain or union root -- so the strict-root repair has to
+        // run here too, on the tools alone, without flattening anything.
+        payload.tools = repairToolSchemaRoots(payload.tools);
       }
       let routedInput = input;
       // The stored call history must use the same tool names as the tool
@@ -1752,6 +1928,11 @@ async function handleResponses(request, response, requestUrl) {
       if (namespacesFlattened) {
         routedInput = flattenNamespacedHistory(routedInput, flattenedNamespaces);
       }
+      // Close finished children the parent left Working. Only when the
+      // collaboration toolset is actually available on this turn.
+      pendingInterrupts = pendingInterruptTargets(input, {
+        namespaces: flattenedNamespaces,
+      });
       const routed = {
         ...payload,
         model: route.gatewayModel,
@@ -1778,8 +1959,30 @@ async function handleResponses(request, response, requestUrl) {
       const native = { ...payload };
       if (Array.isArray(payload.input)) {
         native.input = normalizeNativeInput(payload.input);
+        // Native turns leave here as stateless full conversations (the
+        // previous_response_id below is stripped), so an old tool result costs
+        // its full size on every turn of this path too. Compaction turns are
+        // exempt: compactV1 keeps its chaining, and a summary should read the
+        // true content rather than a receipt.
+        if (!compactV1) {
+          const aged = ageToolResults(native.input, {
+            enabled: nativeToolResultAgingEnabled(),
+          });
+          native.input = aged.input;
+          toolResultAging = aged.stats;
+        }
       }
+      // SF and other native multi-agent parents hit this path (model_provider
+      // openai). They have the same Working-badge bug, so inventory the tools
+      // and queue missing interrupt_agent closes the same way as routed turns.
+      flattenedNamespaces = flattenNamespaceTools(payload.tools).namespaces;
+      pendingInterrupts = pendingInterruptTargets(native.input ?? payload.input, {
+        namespaces: flattenedNamespaces,
+      });
       if (!compactV1) delete native.previous_response_id;
+      if (callerBroughtNoUpstreamCredential(request)) {
+        normalizeNativeForSubstitutedCaller(native);
+      }
       target = nativeTarget(requestUrl.pathname);
       headers = nativeHeaders(request);
       routedBody = await compressedNativeBody(
@@ -1845,7 +2048,10 @@ async function handleResponses(request, response, requestUrl) {
         provider: canonicalProviderId(route.provider),
         status: upstream.status,
         durationMs: Date.now() - startedAt,
+        responseStartMs: upstreamLatencyMs,
+        firstTokenMs,
       });
+      observeSubagentOutcome(request, route, upstream.status);
       finalStatus = upstream.status;
       activityStatus = upstream.status;
       usageRecorded = true;
@@ -1876,12 +2082,19 @@ async function handleResponses(request, response, requestUrl) {
             : undefined,
       });
       const transforms = [usageObserver];
-      // Every attempt uses the same normal transform pipeline. In particular,
-      // a tool call recovered by the retry must still have its flattened
-      // namespace restored before Codex sees it.
-      if (route) {
+      // Restore flattened namespace calls for routed chat-completions providers,
+      // and inject missing finished-child interrupts for both routed and native
+      // multi-agent parents (San Francisco uses native GPT).
+      if (route || pendingInterrupts.length > 0) {
         transforms.push(
-          new NamespaceToolCallTransform(flattenedNamespaces, contentType, route.slug),
+          new NamespaceToolCallTransform(
+            flattenedNamespaces,
+            contentType,
+            route?.slug,
+            // A native stream is attached only for the injection, so it must
+            // not pick up the routed-provider rewrites on the way through.
+            { pendingInterrupts, injectOnly: !route },
+          ),
         );
       }
       const guard =
@@ -1899,6 +2112,12 @@ async function handleResponses(request, response, requestUrl) {
       leaveOpen: relayOpen,
     });
     usage = usageTransform?.tokenUsage();
+    // Time to the first generated token, which is what an output-tokens-per-
+    // second figure has to divide by. `upstreamLatencyMs` stops at the response
+    // headers, and on a reasoning model the gap between the two is seconds of
+    // silent thinking that would otherwise be charged to the generation rate.
+    const firstTokenAt = usageTransform?.firstTokenAt?.();
+    if (firstTokenAt !== undefined) firstTokenMs = firstTokenAt - startedAt;
     estimatedInputTokens = usageTransform?.substitutedInputTokens();
     // The `close` listener above sets `clientGone` when the client's socket
     // goes away, but `pipeResponse` can resolve before that event fires: the
@@ -1915,11 +2134,26 @@ async function handleResponses(request, response, requestUrl) {
     // successful 40-second turn.
     guardReleasedForBudget =
       emptyCompletionGuard?.releasedForBudget() === true && !clientWalkedAway;
-    if (emptyCompletion) {
-      // The upstream answered 200 with nothing. Retry the identical request
-      // once: same bytes, same headers, same signal. The guard discarded the
-      // whole first stream, so the retry supplies the only head, response id,
-      // sequence space, reasoning, and output the client ever receives.
+    // The turn produced nothing, but the guard had already released it: the
+    // upstream proved it was generating (reasoning), so the head, response id,
+    // and prologue are on the wire. A second attempt would graft a second
+    // response onto a stream the client is already reading. State the failure
+    // instead. This is the case the hold used to cover, priced honestly — the
+    // hold cost every reasoning turn up to its full budget of dead air, and
+    // bought a silent rescue on roughly one routed turn in a thousand.
+    if (emptyCompletion && emptyCompletionGuard?.suppressedPrologue() !== true) {
+      emptyCompletionUnrepairable = true;
+      writeStreamErrorEvent(response, {
+        code: "empty_completion",
+        message:
+          "The model streamed reasoning but produced no output. The router could not retry because the response had already started.",
+      });
+    } else if (emptyCompletion) {
+      // The upstream answered 200 with nothing and never proved otherwise, so
+      // the guard still holds every byte. Retry the identical request once:
+      // same bytes, same headers, same signal. The discarded first stream means
+      // the retry supplies the only head, response id, sequence space,
+      // reasoning, and output the client ever receives.
       emptyCompletionRetried = true;
       let upstream2;
       try {
@@ -2044,14 +2278,18 @@ async function handleResponses(request, response, requestUrl) {
       provider: route ? canonicalProviderId(route.provider) : "openai",
       status: finalStatus,
       durationMs: Date.now() - startedAt,
+      responseStartMs: upstreamLatencyMs,
+      firstTokenMs,
       retries: upstreamRetries,
       ...usage,
       estimatedInputTokens,
       ...toolResultAging,
       ...(emptyCompletion ? { emptyCompletion: true } : {}),
       ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
+      ...(emptyCompletionUnrepairable ? { emptyCompletionUnrepairable: true } : {}),
       ...(guardReleasedForBudget ? { emptyCompletionGuardReleased: true } : {}),
     });
+    observeSubagentOutcome(request, route, finalStatus, { emptyCompletion });
     usageRecorded = true;
     activityStatus = finalStatus;
     if (!QUIET) {
@@ -2066,6 +2304,8 @@ async function handleResponses(request, response, requestUrl) {
             : ""
         }${
           emptyCompletionRetried ? " empty-completion-retried=true" : ""
+        }${
+          emptyCompletionUnrepairable ? " empty-completion-unrepairable=true" : ""
         }${emptyCompletion ? " empty-completion=true" : ""}`,
       );
     }
@@ -2106,6 +2346,8 @@ async function handleResponses(request, response, requestUrl) {
           provider: route ? canonicalProviderId(route.provider) : "openai",
           status: 0,
           durationMs: Date.now() - startedAt,
+          responseStartMs: upstreamLatencyMs,
+        firstTokenMs,
           retries: upstreamRetries,
           ...usage,
           estimatedInputTokens,
@@ -2129,6 +2371,8 @@ async function handleResponses(request, response, requestUrl) {
         provider: route ? canonicalProviderId(route.provider) : "openai",
         status: finalStatus,
         durationMs: Date.now() - startedAt,
+        responseStartMs: upstreamLatencyMs,
+        firstTokenMs,
         retries: upstreamRetries,
         ...usage,
         estimatedInputTokens,
@@ -2163,6 +2407,12 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
   let requestedModel = defaultModel;
   try {
     if (!requireCodexTransport(request, response)) return;
+    // Image and web-search turns are native-only; an idle install refuses
+    // them locally rather than forwarding to chatgpt.com.
+    if (discoveryDisabled()) {
+      writeIdleNoProviderError(response);
+      return;
+    }
     const encoded = await readRequestBody(request);
     const body = decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
@@ -2282,6 +2532,12 @@ async function handleRequest(request, response) {
     return;
   }
   requestUrl.pathname = route;
+
+  // Behind the caller capability, like every other local endpoint: the panel
+  // reads the same data the tray does, so it is gated the same way.
+  if (isPanelRoute(route) && (await handlePanelRequest(request, response, route, { writeJson }))) {
+    return;
+  }
 
   if (
     request.method === "GET" &&
