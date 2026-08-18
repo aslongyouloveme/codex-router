@@ -6166,6 +6166,10 @@ private struct PoolKeyCard: View {
     return routerAccent
   }
   private func compactMetric(_ m: ProviderAccountMetric) -> String {
+    if m.kind == "balance", let value = m.value {
+      let fmt: (Double)->String = { v in v >= 10 ? String(format: "%.1f", v) : String(format: "%.2f", v) }
+      return "\(fmt(value)) \(m.unit ?? "credits")"
+    }
     guard let used = m.used, let limit = m.limit else { return "—" }
     let fmt: (Double)->String = { v in v >= 10 ? String(format: "%.1f", v) : String(format: "%.2f", v) }
     return "\(fmt(used))/\(fmt(limit))"

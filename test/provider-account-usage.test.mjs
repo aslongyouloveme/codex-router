@@ -232,58 +232,21 @@ test("anonymous free providers degrade to traffic-only usage without a balance A
   assert.match(snapshot["kilo-free"].message, /quota is not exposed/);
 });
 
-test("Command Code usage reads plan windows from the billing credits API", async () => {
+test("Command Code usage keeps the pane traffic-only (quota lives in the key pool)", async () => {
   delete process.env.COMMAND_CODE_API_KEY;
   delete process.env.COMMANDCODE_API_KEY;
   process.env.COMMAND_CODE_API_KEY = "TEST_COMMANDCODE_USAGE_KEY";
   try {
     const snapshot = await providerAccountUsageSnapshot({
       providerIds: ["commandcode"],
-      fetchImpl: async (url, options) => {
-        assert.equal(url, "https://api.commandcode.ai/alpha/billing/credits");
-        assert.equal(options.headers.Authorization, "Bearer TEST_COMMANDCODE_USAGE_KEY");
-        return new Response(JSON.stringify({
-          credits: { monthlyCredits: 10, purchasedCredits: 0, freeCredits: 0 },
-          windowLimits: {
-            limited: true,
-            fiveHour: { used: 1, cap: 3, exceeded: false, resetAt: 1_786_579_200 },
-            weekly: { used: 2, cap: 6, exceeded: false, resetAt: 0 },
-          },
-        }));
+      fetchImpl: async () => {
+        throw new Error("billing API must not be queried for the account pane");
       },
     });
-    assert.equal(snapshot.commandcode.status, "available");
+    assert.equal(snapshot.commandcode.status, "local-only");
     assert.equal(snapshot.commandcode.dashboardUrl, "https://commandcode.ai/studio");
-    assert.deepEqual(snapshot.commandcode.metrics, [
-      {
-        kind: "quota",
-        label: "5-hour limit",
-        usedPercent: (1 / 3) * 100,
-        remainingPercent: 100 - (1 / 3) * 100,
-        used: 1,
-        limit: 3,
-        remaining: 2,
-        unit: "credits",
-        resetAt: 1_786_579_200,
-      },
-      {
-        kind: "quota",
-        label: "Weekly limit",
-        usedPercent: (2 / 6) * 100,
-        remainingPercent: 100 - (2 / 6) * 100,
-        used: 2,
-        limit: 6,
-        remaining: 4,
-        unit: "credits",
-      },
-      {
-        kind: "balance",
-        label: "Monthly credits",
-        value: 10,
-        currency: "credits",
-      },
-    ]);
-    assert.doesNotMatch(JSON.stringify(snapshot), /TEST_COMMANDCODE_USAGE_KEY/);
+    assert.deepEqual(snapshot.commandcode.metrics, []);
+    assert.match(snapshot.commandcode.message, /key pool/);
   } finally {
     delete process.env.COMMAND_CODE_API_KEY;
   }
@@ -318,7 +281,7 @@ test("Command Code usage avoids the billing API for a custom endpoint", async ()
       },
     });
     assert.equal(snapshot.commandcode.status, "local-only");
-    assert.match(snapshot.commandcode.message, /custom Command Code endpoint/);
+    assert.match(snapshot.commandcode.message, /key pool/);
   } finally {
     delete process.env.COMMAND_CODE_API_KEY;
     delete process.env.COMMANDCODE_BASE_URL;
