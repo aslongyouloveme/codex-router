@@ -109,7 +109,29 @@ export function buildQuotaCards({ account, providerUsage, providerSetup } = {}) 
   const cards = [];
   const seen = new Set();
   const add = (providerId, providerName, metric, source = "account") => {
-    if (!metric || metric.kind && metric.kind !== "quota") return;
+    if (!metric || !metric.kind) return;
+    if (metric.kind === "balance") {
+      const value = Number(metric.value);
+      if (!Number.isFinite(value)) return;
+      const key = `balance:${providerId}:${String(metric.label || "")}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      cards.push({
+        kind: "balance",
+        key,
+        providerId,
+        providerName,
+        source,
+        label: typeof metric.label === "string" ? metric.label : "Balance",
+        value,
+        currency: typeof metric.currency === "string" ? metric.currency : "",
+        detail: typeof metric.detail === "string" ? metric.detail : "",
+        available: metric.available !== false,
+        resetAt: Number(metric.resetsAt ?? metric.resetAt) || null,
+      });
+      return;
+    }
+    if (metric.kind !== "quota") return;
     const window = quotaWindow(metric);
     if (!window) return;
     const key = `${providerId}:${window.key}`;

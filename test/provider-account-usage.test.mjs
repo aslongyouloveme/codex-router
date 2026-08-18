@@ -276,6 +276,12 @@ test("Command Code usage reads plan windows from the billing credits API", async
         remaining: 4,
         unit: "credits",
       },
+      {
+        kind: "balance",
+        label: "Monthly credits",
+        value: 10,
+        currency: "credits",
+      },
     ]);
     assert.doesNotMatch(JSON.stringify(snapshot), /TEST_COMMANDCODE_USAGE_KEY/);
   } finally {

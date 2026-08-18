@@ -105,6 +105,46 @@ test("quota cards omit unconfigured providers and de-duplicate synonymous window
   );
 });
 
+test("balance metrics render as value cards instead of percentage bars", () => {
+  const cards = buildQuotaCards({
+    providerSetup: {
+      providers: [{ id: "commandcode", configured: true }],
+    },
+    providerUsage: {
+      providers: [
+        {
+          id: "commandcode",
+          displayName: "CommandCode",
+          account: {
+            metrics: [
+              { kind: "quota", label: "5 hour", usedPercent: 3 },
+              { kind: "balance", label: "Monthly credits", value: 9.985, currency: "credits", detail: "purchased + free" },
+              { kind: "balance", label: "Non-numeric", value: "n/a" },
+            ],
+          },
+        },
+      ],
+    },
+  });
+
+  assert.equal(cards.filter((card) => card.kind === "balance").length, 1);
+  const balance = cards.find((card) => card.kind === "balance");
+  assert.deepEqual(balance, {
+    kind: "balance",
+    key: "balance:commandcode:Monthly credits",
+    providerId: "commandcode",
+    providerName: "CommandCode",
+    source: "provider",
+    label: "Monthly credits",
+    value: 9.985,
+    currency: "credits",
+    detail: "purchased + free",
+    available: true,
+    resetAt: null,
+  });
+  assert.equal(cards.find((card) => card.window === "five-hour")?.usedPercent, 3);
+});
+
 test("quota remaining percentage prefers provider data and derives from usage", () => {
   assert.equal(metricRemainingPercent({ usedPercent: 35 }), 65);
   assert.equal(metricRemainingPercent({ used: 25, limit: 100 }), 75);

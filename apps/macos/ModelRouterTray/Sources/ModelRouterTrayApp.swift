@@ -143,6 +143,8 @@ final class RouterStore: ObservableObject {
   @Published private(set) var accountUsageError: String?
   @Published private(set) var providerUsage: ProviderUsageSnapshot?
   @Published private(set) var providerUsageError: String?
+  @Published private(set) var poolUsage: PoolUsageSnapshot?
+  @Published private(set) var poolUsageError: String?
   @Published private(set) var providerSetup: [String: ProviderSetupState] = [:]
   @Published private(set) var providerOperation: String?
   @Published private(set) var visionDownload: VisionDownloadState?
@@ -177,6 +179,7 @@ final class RouterStore: ObservableObject {
   private var activityPolling = false
   private var accountUsagePolling = false
   private var providerPolling = false
+  private var poolUsagePolling = false
   private let defaults = UserDefaults.standard
   private let islandVisibilityKey = "ModelRouterTray.islandVisible"
   private let islandModeKey = "ModelRouterTray.islandMode"
@@ -1098,14 +1101,53 @@ final class RouterStore: ObservableObject {
     guard !accountUsagePolling else { return }
     accountUsagePolling = true
     defer { accountUsagePolling = false }
+    // Pool credits are tied to the same 30s loop and stop when the tray
+    // stops. When the app quits or surfaces hide, this task is cancelled.
+    let poolTask = Task { await self.startPoolUsagePolling() }
+    defer { poolTask.cancel() }
     while !Task.isCancelled {
       await refreshAccountUsage()
       await refreshProviderUsage()
+      // Seed the first pool fetch without waiting a full interval.
+      if poolUsage == nil { await refreshPoolUsage() }
       do {
         try await Task.sleep(nanoseconds: 30 * 1_000_000_000)
       } catch {
         return
       }
+    }
+  }
+
+  func startPoolUsagePolling() async {
+    guard !poolUsagePolling else { return }
+    poolUsagePolling = true
+    defer { poolUsagePolling = false }
+    while !Task.isCancelled {
+      await refreshPoolUsage()
+      do {
+        try await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+      } catch {
+        return
+      }
+    }
+  }
+
+  func refreshPoolUsage() async {
+    do {
+      var request = URLRequest(url: URL(string: "http://127.0.0.1:3050/pool/usage")!)
+      request.timeoutInterval = 8
+      let (data, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        throw URLError(.badServerResponse)
+      }
+      let next = try JSONDecoder().decode(PoolUsageSnapshot.self, from: data)
+      if poolUsage != next { poolUsage = next }
+      if poolUsageError != nil { poolUsageError = nil }
+    } catch {
+      // Pool is loopback-only; when the proxy is not running the tray keeps
+      // the last snapshot and surfaces the error only when nothing is shown.
+      let msg = error.localizedDescription
+      if poolUsage == nil, poolUsageError != msg { poolUsageError = msg }
     }
   }
 
@@ -2395,6 +2437,39 @@ struct ProviderAccountMetric: Decodable, Equatable {
   var resetDate: Date? { resetAt.map(Date.init(timeIntervalSince1970:)) }
 }
 
+// Pool usage from the local commandcode-proxy loopback endpoint.
+// Decoded only by the tray, so `anyModel` keeps the proxy free to change
+// its credits/metrics shape without breaking the router snapshot.
+struct PoolCreditsEntry: Decodable, Equatable {
+  let ok: Bool?
+  let status: Int?
+  let error: String?
+  let metrics: [ProviderAccountMetric]?
+}
+
+struct PoolKeyUsage: Decodable, Equatable, Identifiable {
+  let keyPrefix: String
+  let index: Int?
+  let active: Bool?
+  let disabled: Bool?
+  let reason: String?
+  let disabledUntil: String?
+  let retryAt: String?
+  let credits: PoolCreditsEntry?
+  var id: String { keyPrefix }
+}
+
+struct PoolUsageSnapshot: Decodable, Equatable {
+  let poolEnabled: Bool?
+  let poolSize: Int?
+  let activeIndex: Int?
+  let activeKeyPrefix: String?
+  let loopbackOnly: Bool?
+  let fetchedAt: String?
+  let cacheTtlMs: Int?
+  let keys: [PoolKeyUsage]
+}
+
 struct ProviderDailyUsageBucket: Decodable, Equatable {
   let startDate: String
   let tokens: Int64
@@ -3068,6 +3143,9 @@ private struct TrayView: View {
       sectionLabel(routerLocalized("All usage"), detail: routerLocalized("7-day snapshot"))
       AllProviderUsageGrid(store: store)
     }
+      if store.selectedUsageProviderID == "commandcode" {
+        CommandCodePoolSection(store: store)
+      }
     if !store.overallModelUsage.isEmpty {
       sectionLabel(
         routerLocalized("Tokens by model"),
@@ -5729,7 +5807,11 @@ private struct ProviderUsageSection: View {
             .monospacedDigit()
         }
       } else {
-        HStack(alignment: .top, spacing: 8) {
+        LazyVGrid(
+          columns: [GridItem(.adaptive(minimum: 120), spacing: 10)],
+          alignment: .leading,
+          spacing: 10
+        ) {
           ForEach(quotaCards) { card in
             CurrentUsageLimitCard(card: card)
           }
@@ -5820,7 +5902,7 @@ private struct ProviderUsageSection: View {
       if store.selectedUsageUsesChatGPT {
         return card.remainingPercent != nil
       }
-      return card.metric?.kind == "quota"
+      return card.metric?.kind == "quota" || card.metric?.kind == "balance"
     }
   }
 
@@ -5937,10 +6019,10 @@ private struct CurrentUsageLimitCard: View {
       Text(resetText)
         .font(.system(size: 8.5))
         .foregroundStyle(routerMuted)
-        .lineLimit(1)
+        .lineLimit(2)
     }
     .padding(10)
-    .frame(maxWidth: .infinity, minHeight: 65, alignment: .leading)
+    .frame(maxWidth: .infinity, minHeight: 74, alignment: .leading)
     .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
   }
 
@@ -5953,13 +6035,145 @@ private struct CurrentUsageLimitCard: View {
   }
 
   private var resetText: String {
+    if card.metric?.kind == "balance", let detail = card.metric?.detail, !detail.isEmpty {
+      return detail
+    }
     guard let reset = card.resetDate else { return routerLocalized("No reset reported") }
     return usageResetCaption(reset)
   }
 
-  private var remainingFraction: CGFloat? {
+  
+private var remainingFraction: CGFloat? {
     guard let remaining = card.remainingPercent else { return nil }
     return CGFloat(max(0, min(100, remaining))) / 100
+  }
+}
+
+private struct CommandCodePoolSection: View {
+  @ObservedObject var store: RouterStore
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack(spacing: 8) {
+        Text(store.poolUsage?.poolEnabled == true ? routerLocalized("Command Code key pool") : routerLocalized("Command Code usage"))
+          .font(.system(size: 10, weight: .medium))
+          .foregroundStyle(routerMuted)
+        Spacer()
+        if let fetched = store.poolUsage?.fetchedAt, let date = ISO8601DateFormatter().date(from: fetched) {
+          Text(RelativeDateTimeFormatter().localizedString(for: date, relativeTo: Date()))
+            .font(.system(size: 8.5))
+            .foregroundStyle(routerMuted)
+        }
+      }
+      if let pool = store.poolUsage, pool.poolEnabled == true {
+        HStack(spacing: 8) {
+          Label("Pool \(pool.poolSize ?? 0) keys", systemImage: "key.2.on.ring")
+            .font(.system(size: 9, weight: .medium))
+            .foregroundStyle(routerMuted)
+          if let active = pool.activeKeyPrefix {
+            Label("active \(active)***", systemImage: "bolt.fill")
+              .font(.system(size: 9, weight: .medium))
+              .foregroundStyle(routerMint)
+          }
+          Spacer()
+        }
+        ForEach(pool.keys) { key in
+          PoolKeyCard(key: key)
+        }
+        if let err = store.poolUsageError {
+          Text(err).font(.system(size: 8.5)).foregroundStyle(routerYellow).lineLimit(2)
+        }
+      } else if let pool = store.poolUsage, pool.poolEnabled == false {
+        // Single-key fallback still shows loopback fetch result.
+        ForEach(pool.keys) { key in PoolKeyCard(key: key) }
+      } else {
+        HStack(spacing: 6) {
+          ProgressView().controlSize(.mini).tint(routerMuted)
+          Text(store.poolUsage == nil ? routerLocalized("Loading pool usage…") : (store.poolUsageError ?? ""))
+            .font(.system(size: 9))
+            .foregroundStyle(routerMuted)
+            .lineLimit(1)
+          Spacer()
+          Button("Retry") { Task { await store.refreshPoolUsage() } }
+            .buttonStyle(.plain).font(.system(size: 9, weight: .medium)).foregroundStyle(routerAccent)
+        }
+      }
+    }
+    .padding(9)
+    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+  }
+}
+
+private struct PoolKeyCard: View {
+  let key: PoolKeyUsage
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      HStack(spacing: 6) {
+        Circle().fill(statusColor).frame(width: 6, height: 6)
+        Text("\(key.keyPrefix)***")
+          .font(.system(size: 9, weight: .semibold, design: .monospaced))
+          .lineLimit(1)
+        if key.active == true {
+          Text("ACTIVE").font(.system(size: 7, weight: .bold)).padding(.horizontal, 4).padding(.vertical, 1)
+            .background(routerMint.opacity(0.18), in: Capsule()).foregroundStyle(routerMint)
+        }
+        if key.disabled == true { Text(key.reason ?? "cooldown").font(.system(size: 7)).foregroundStyle(routerYellow).lineLimit(1) }
+        Spacer()
+        if let err = key.credits?.error, key.credits?.ok != true {
+          Text(err).font(.system(size: 7)).foregroundStyle(routerRed).lineLimit(1)
+        }
+      }
+      if let metrics = key.credits?.metrics, !metrics.isEmpty {
+        HStack(spacing: 8) {
+          ForEach(metrics, id: \.label) { m in
+            VStack(alignment: .leading, spacing: 3) {
+              Text(m.label).font(.system(size: 8)).foregroundStyle(routerMuted).lineLimit(1)
+              HStack(spacing: 4) {
+                Text(compactMetric(m)).font(.system(size: 9, weight: .semibold)).monospacedDigit()
+                if let pct = m.remainingPercent {
+                  Text("\(Int(pct.rounded()))%").font(.system(size: 7)).foregroundStyle(pct < 10 ? routerRed : routerMuted)
+                }
+              }
+              if let pct = m.remainingPercent {
+                GeometryReader { g in
+                  ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.09))
+                    Capsule().fill(barColor(pct)).frame(width: g.size.width * CGFloat(max(0, min(100, pct)))/100)
+                  }
+                }.frame(height: 3)
+              }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+          }
+        }
+      } else if key.credits?.ok == false {
+        Text(key.credits?.error ?? "No credits data").font(.system(size: 8)).foregroundStyle(routerMuted)
+      }
+      if let until = key.retryAt ?? key.disabledUntil, key.disabled == true {
+        Text("retry \(until)").font(.system(size: 7)).foregroundStyle(routerMuted).lineLimit(1)
+      }
+    }
+    .padding(7)
+    .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    .overlay(RoundedRectangle(cornerRadius: 8).stroke(key.active == true ? routerMint.opacity(0.22) : Color.clear, lineWidth: 1))
+  }
+
+  private var statusColor: Color {
+    if key.disabled == true { return routerYellow }
+    if key.active == true { return routerMint }
+    if key.credits?.ok == false { return routerRed }
+    return routerAccent
+  }
+  private func compactMetric(_ m: ProviderAccountMetric) -> String {
+    guard let used = m.used, let limit = m.limit else { return "—" }
+    let fmt: (Double)->String = { v in v >= 10 ? String(format: "%.1f", v) : String(format: "%.2f", v) }
+    return "\(fmt(used))/\(fmt(limit))"
+  }
+  private func barColor(_ pct: Double) -> Color {
+    if pct < 10 { return routerRed }
+    if pct < 30 { return routerYellow }
+    return routerAccent
   }
 }
 
@@ -6202,7 +6416,8 @@ private struct AllProviderUsageCard: View {
     return routerLocalized("Local router traffic")
   }
 
-  private var remainingFraction: CGFloat? {
+  
+private var remainingFraction: CGFloat? {
     guard let remaining = card.remainingPercent else { return nil }
     return CGFloat(max(0, min(100, remaining))) / 100
   }
@@ -6397,12 +6612,22 @@ func formattedAccountMetric(_ metric: ProviderAccountMetric) -> String {
     return "\(Int(remaining.rounded()))% left"
   }
   if metric.kind == "balance", let value = metric.value {
-    let formatter = NumberFormatter()
-    formatter.numberStyle = .currency
-    formatter.currencyCode = metric.currency ?? "USD"
-    formatter.minimumFractionDigits = 2
-    formatter.maximumFractionDigits = 2
-    return formatter.string(from: NSNumber(value: value)) ?? String(format: "%.2f", value)
+    let currency = metric.currency ?? ""
+    // Only use the currency formatter for real ISO 4217 codes (3 uppercase letters);
+    // "credits", "tokens", and similar non-ISO codes are shown as a plain number
+    // with the unit as a suffix.
+    if currency.utf8.count == 3, currency.allSatisfy({ $0.isASCII && $0.isUppercase }) {
+      let formatter = NumberFormatter()
+      formatter.numberStyle = .currency
+      formatter.currencyCode = currency
+      formatter.minimumFractionDigits = 2
+      formatter.maximumFractionDigits = 2
+      if let formatted = formatter.string(from: NSNumber(value: value)) {
+        return formatted
+      }
+    }
+    let v = value >= 10 ? String(format: "%.1f", value) : String(format: "%.2f", value)
+    return currency.isEmpty ? v : "\(v) \(currency)"
   }
   return "—"
 }

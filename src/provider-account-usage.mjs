@@ -309,6 +309,33 @@ export function commandCodeCreditsMetrics(payload) {
   ].filter(Boolean);
 }
 
+// Command Code returns the account's remaining credit balance on the same
+// billing endpoint, under `credits`; surface it as a balance card alongside
+// the plan windows (which codex-router already renders).
+export function commandCodeCreditsBalanceMetrics(payload) {
+  const credits = payload?.credits;
+  if (!credits || typeof credits !== "object") return [];
+  const value = numberValue(credits.monthlyCredits);
+  if (!Number.isFinite(value)) return [];
+  const purchased = numberValue(credits.purchasedCredits);
+  const free = numberValue(credits.freeCredits);
+  const metric = {
+    kind: "balance",
+    label: "Monthly credits",
+    value,
+    currency: "credits",
+  };
+  if (typeof credits.belowThreshold === "boolean") {
+    metric.available = credits.belowThreshold !== true;
+  }
+  const detail = [
+    Number.isFinite(purchased) && purchased !== 0 ? `Purchased ${purchased.toFixed(2)}` : undefined,
+    Number.isFinite(free) && free !== 0 ? `Free ${free.toFixed(2)}` : undefined,
+  ].filter(Boolean).join(" · ");
+  if (detail) metric.detail = detail;
+  return [metric];
+}
+
 export function githubCopilotQuotaMetrics(payload) {
   const reset =
     payload?.quota_reset_date ??
@@ -685,10 +712,10 @@ async function commandCodeAccount(fetchImpl) {
     ...withHeaderQuota("commandcode", localOnly(message)),
     dashboardUrl: COMMANDCODE_DASHBOARD_URL,
   });
-  const baseURL = (process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
-  if (new URL(baseURL).origin !== "https://api.commandcode.ai") {
-    return fallback("Account usage is unavailable for a custom Command Code endpoint");
-  }
+  // Billing/credits live on the official Command Code API, independent of any
+  // routing base URL. So even when traffic is proxied (COMMANDCODE_BASE_URL),
+  // still query the official endpoint for real windows and balance; any failure
+  // degrades to the fallback below.
   try {
     const payload = await requestJson(
       "https://api.commandcode.ai/alpha/billing/credits",
@@ -696,9 +723,12 @@ async function commandCodeAccount(fetchImpl) {
       {},
       fetchImpl,
     );
-    const metrics = commandCodeCreditsMetrics(payload);
+    const metrics = [
+      ...commandCodeCreditsMetrics(payload),
+      ...commandCodeCreditsBalanceMetrics(payload),
+    ];
     if (!metrics.length) {
-      return fallback("Command Code reported no plan windows; showing router traffic");
+      return fallback("Command Code reported no plan windows or balance; showing router traffic");
     }
     return {
       status: "available",

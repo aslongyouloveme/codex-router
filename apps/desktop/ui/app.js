@@ -452,6 +452,19 @@ function startPanel() {
     elements.quotaCards.innerHTML = cards.length
       ? cards
           .map((card) => {
+            if (card.kind === "balance") {
+              const value = Number(card.value);
+              const shown = Number.isFinite(value)
+                ? value.toLocaleString(undefined, { maximumFractionDigits: 3 })
+                : "—";
+              const suffix = card.currency ? ` ${escapeHtml(card.currency)}` : "";
+              const detail = card.detail ? `<p>${escapeHtml(card.detail)}</p>` : "";
+              return `<article class="quota-card balance-card">
+                <header><span class="quota-provider">${escapeHtml(card.providerName)}</span><span class="quota-value">${shown}${suffix}</span></header>
+                <h3>${escapeHtml(card.label)}</h3>
+                ${detail}
+              </article>`;
+            }
             const percent = card.remainingPercent === null ? "—" : `${Math.round(card.remainingPercent)}%`;
             const progress = card.remainingPercent === null ? 0 : card.remainingPercent;
             return `<article class="quota-card">
