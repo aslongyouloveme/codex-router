@@ -136,6 +136,7 @@ const BUNDLED_BACKFILL_FIELDS = Object.freeze([
   "experimental_supported_tools",
   "include_apps_usage_instructions",
   "model_messages",
+  "supports_parallel_tool_calls",
 ]);
 
 // The account catalog may use an older schema and publish empty fields for
@@ -488,6 +489,12 @@ function rewriteModelMessages(messages, model) {
 function normalizeNativeModel(model) {
   return {
     ...model,
+    // Older Codex catalogs omit this required capability field even though
+    // the native coding models support parallel tool calls.
+    supports_parallel_tool_calls:
+      typeof model.supports_parallel_tool_calls === "boolean"
+        ? model.supports_parallel_tool_calls
+        : true,
     supports_reasoning_summaries:
       typeof model.supports_reasoning_summaries === "boolean"
         ? model.supports_reasoning_summaries

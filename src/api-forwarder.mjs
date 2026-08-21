@@ -448,9 +448,9 @@ function normalizeBody(buffer, contentType, route) {
     model.requestProfile === "deepseek-force-max" ||
     model.requestProfile === "deepseek-force-max-auto-tool-choice"
   ) {
-    // Command Code and opencode Go DeepSeek V4 flash/pro are pinned to the
-    // model's max reasoning tier on every request. The picker keeps its
-    // normal levels and the operator selects "high", but the upstream always
+    // Command Code DeepSeek/Ox Alpha and opencode Go DeepSeek V4 flash/pro are
+    // pinned to the model's max reasoning tier on every request. The picker
+    // keeps its normal levels and the operator selects "high", but the upstream always
     // sees max. LiteLLM can drop the inbound field entirely, so never depend
     // on the caller-supplied value.
     payload.reasoning_effort = "max";

@@ -3343,6 +3343,53 @@ test("API forwarder routes Command Code chat and Messages surfaces", async () =>
   }
 });
 
+test("API forwarder pins Command Code Ox Alpha to max reasoning", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push({ body: await bodyJson(request) });
+    json(response, 200, {
+      id: "chatcmpl_ox_alpha",
+      object: "chat.completion",
+      model: "stealth/ox-alpha",
+      choices: [{ index: 0, message: { role: "assistant", content: "OK" }, finish_reason: "stop" }],
+    });
+  });
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    COMMANDCODE_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    COMMAND_CODE_API_KEY: "TEST_COMMANDCODE_API_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    const response = await fetch(
+      `http://127.0.0.1:${forwarderPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "commandcode-ox-alpha",
+          reasoning_effort: "high",
+          messages: [{ role: "user", content: "test" }],
+        }),
+      },
+    );
+    assert.equal(response.status, 200);
+    assert.equal(upstreamRequests[0].body.model, "stealth/ox-alpha");
+    assert.equal(upstreamRequests[0].body.reasoning_effort, "max");
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+  }
+});
+
 test("router strips empty text parts and drops the messages left with nothing", async () => {
   const gatewayRequests = [];
   const gateway = await mockServer(async (request, response) => {

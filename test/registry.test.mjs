@@ -72,8 +72,11 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/mimo-v2.5-pro",
       "commandcode/minimax-m2.7",
       "commandcode/minimax-m3",
+      "commandcode/muse-spark-1.1",
+      "commandcode/muse-spark-1.2-contributor",
       "commandcode/muse-spark-1.2",
       "commandcode/nemotron-3-ultra",
+      "commandcode/ox-alpha",
       "commandcode/qwen3.7-flash",
       "commandcode/qwen3.7-max",
       "commandcode/qwen3.7-plus",
@@ -342,6 +345,12 @@ test("provider registry exposes configured API and OAuth model families", () => 
     assert.equal(MODEL_BY_SLUG.get(slug).multiAgentVersion, undefined, slug);
   }
   assert.equal(MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").multiAgentVersion, undefined);
+  const oxAlpha = MODEL_BY_SLUG.get("commandcode/ox-alpha");
+  assert.equal(oxAlpha.upstreamModel, "stealth/ox-alpha");
+  assert.equal(oxAlpha.requestProfile, "deepseek-force-max");
+  assert.deepEqual(oxAlpha.reasoningLevels.map((level) => level.effort), ["high", "max"]);
+  assert.equal(oxAlpha.contextWindow, 1_048_576);
+  assert.deepEqual(oxAlpha.inputModalities, ["text", "image"]);
   for (const slug of [
     "kimi-oauth/kimi-for-coding-highspeed",
     "kimi-oauth/kimi-for-coding",

@@ -328,6 +328,13 @@ test("merged catalog preserves an explicit native reasoning summary capability",
   assert.equal(merged[0].supports_reasoning_summaries, true);
 });
 
+test("merged catalog supplies the required native parallel-tool capability", () => {
+  const native = { ...template };
+  delete native.supports_parallel_tool_calls;
+  const merged = buildMergedCatalog({ models: [native] }, []);
+  assert.equal(merged[0].supports_parallel_tool_calls, true);
+});
+
 test("login-free catalogs contain only authenticated external models", () => {
   const merged = buildMergedCatalog({ models: [template] }, [grok], {
     includeNative: false,
@@ -656,8 +663,23 @@ test("native catalog merge never loses non-empty bundled metadata", () => {
     mergeNativeModel(
       { slug: "gpt-5.6-luna", visibility: "list" },
       { slug: "gpt-5.6-luna", visibility: "hide" },
-    ).visibility,
+  ).visibility,
     "list",
+  );
+});
+
+test("native catalog merge backfills bundled parallel tool support", () => {
+  const merged = mergeNativeModel(
+    { slug: "gpt-5.2", supports_parallel_tool_calls: undefined },
+    { slug: "gpt-5.2", supports_parallel_tool_calls: true },
+  );
+  assert.equal(merged.supports_parallel_tool_calls, true);
+  assert.equal(
+    mergeNativeModel(
+      { slug: "gpt-5.2", supports_parallel_tool_calls: false },
+      { slug: "gpt-5.2", supports_parallel_tool_calls: true },
+    ).supports_parallel_tool_calls,
+    false,
   );
 });
 

@@ -98,7 +98,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     store.startHostAppObservation()
     Task { await store.startPolling() }
     Task { await store.startActivityPolling() }
-    Task { await store.startAccountUsagePolling() }
+    // Usage auto-refresh (account/provider/pool) temporarily disabled; use the
+    // panel Refresh button to load it on demand.
+    // Task { await store.startAccountUsagePolling() }
     Task { await store.startProviderPolling() }
     if Self.launchedByUser { store.revealForUserLaunch() }
   }
@@ -5432,6 +5434,7 @@ private struct TrayView: View {
           await store.refresh()
           await store.refreshAccountUsage()
           await store.refreshProviderUsage()
+          await store.refreshPoolUsage()
           await store.refreshProviderSetup()
         }
       }
