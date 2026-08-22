@@ -532,6 +532,11 @@ export function localModelsSnapshot({
   }
   for (const family of families.values()) family.variants.sort();
   let download = readLocalDownload();
+  // Cancellation leaves a tombstone in the protected state file
+  // so a worker that is still unwinding cannot resurrect its progress. It is
+  // not an operation anymore, though: every client should clear its status
+  // card as soon as the cancel command succeeds.
+  if (download?.status === "cancelled") download = null;
   // Older uninstall workers recorded an error when Ollama had already
   // removed the weights but the optional Codex catalog refresh failed.  The
   // inventory is authoritative here: do not keep showing a red "removal
@@ -1045,6 +1050,24 @@ export function renderLocalModels(snapshot) {
       `  ./bin/control local-models install ${(coding[0] || vision[0]).tag} --yes`,
       "  Any valid Ollama tag or ollama.com model URL also works.",
     );
+  }
+  // Present whenever the snapshot carries it, including the not-running case:
+  // an LM Studio user who stopped the server should read "not running", not
+  // watch the whole section vanish as if support had gone away.
+  const lmstudio = snapshot.lmstudio;
+  if (lmstudio) {
+    lines.push("", `${lmstudio.displayName || "LM Studio"}:`);
+    if (!lmstudio.reachable && lmstudio.models.length === 0) {
+      lines.push("  Not running. Start LM Studio's local server to list its models.");
+    } else {
+      for (const model of lmstudio.models) {
+        lines.push(
+          `  ${model.enabled ? "[x]" : "[ ]"} ${model.id}` +
+            `${model.served ? "" : "  · not currently served"}`,
+        );
+      }
+      lines.push("  Toggle one:  ./bin/control local-models lmstudio-set <id> on|off");
+    }
   }
   return lines.join("\n");
 }

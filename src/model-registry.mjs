@@ -1,8 +1,9 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
+import { instructionOverlayExists } from "./instruction-overlays.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
-import { readUserModels } from "./user-models.mjs";
+import { officialModelDisplayName, readUserModels } from "./user-models.mjs";
 
 export const REGISTRY_PATH =
   process.env.MODEL_ROUTER_REGISTRY ||
@@ -22,6 +23,17 @@ const ANONYMOUS_ENDPOINTS = Object.freeze({
   "kilo-free": "https://api.kilo.ai/api/gateway",
 });
 
+// The same guarantee, one level down. A per-model endpoint moves the address
+// out of the provider and into the model, so the allowlist has to follow it or
+// it stops being an allowlist at all: without this, adding a JSON fragment
+// under `config/custom/` would be enough to make the router send an operator's
+// prompts to any HTTPS host on earth with no credential and no review. Keyed
+// on the slug, which is what a fragment cannot forge without colliding.
+const ANONYMOUS_MODEL_ENDPOINTS = Object.freeze({
+  "custom/qwen3.8-27b":
+    "https://g9hnto0u7lvbu837.us-east-2.aws.endpoints.huggingface.cloud/v1",
+});
+
 export function anonymousModelAllowed(provider, modelId) {
   const id = typeof modelId === "string" ? modelId.trim() : "";
   if (provider?.authMode !== "anonymous" || !id) return false;
@@ -30,6 +42,27 @@ export function anonymousModelAllowed(provider, modelId) {
   }
   if (provider.anonymousModelPolicy === "suffix-free") return id.endsWith(":free");
   return false;
+}
+
+// A provider that defers its address to its models has no endpoint of its own,
+// so every consumer that used to read `provider.baseUrl` has to ask this
+// instead. The descriptor is deliberately provider-shaped: `baseUrl`,
+// `authMode`, `keyless`, and `credential` mean exactly what they mean on a
+// provider, so `resolveProviderBaseUrl` and the whole credential resolution
+// chain accept one unchanged rather than growing a parallel implementation.
+// Its `id` is the model slug, which is what makes a per-model credential file
+// and Keychain entry distinct from every other endpoint's.
+export function endpointForModel(model, providers = PROVIDERS) {
+  const provider = providers.get(model?.provider);
+  return provider?.perModelEndpoint ? model.endpoint : provider;
+}
+
+// "Nothing for the operator to supply to *this provider*" — three different
+// reasons, one consequence, and every surface that offers to take a key has to
+// agree on it. Named once because the list grew a third member and the four
+// call sites that spelled it inline would each have had to be found.
+export function providerNeedsNoKey(provider) {
+  return Boolean(provider?.keyless) || ["anonymous", "per-model"].includes(provider?.authMode);
 }
 
 function normalizedBaseUrl(value) {
@@ -131,34 +164,6 @@ export function readRegistryDocument(root = REGISTRY_PATH) {
   return { version: 1, providers, models };
 }
 
-// An optional `credential.cliSession` lets a provider reuse the API key its
-// own CLI stores after a browser sign-in. The descriptor names one file inside
-// one directory of the user's home, so a stray separator or `..` would let the
-// registry point the reader at an arbitrary path; reject those at load time.
-function cliSessionProblem(provider) {
-  // A keyless provider has no credential block at all, so there is no CLI
-  // session descriptor to validate.
-  const session = provider.credential?.cliSession;
-  if (session === undefined) return undefined;
-  if (!session || typeof session !== "object" || Array.isArray(session)) {
-    return `provider ${provider.id} has an invalid credential.cliSession`;
-  }
-  for (const field of ["directory", "file", "field", "label", "loginCommand"]) {
-    if (typeof session[field] !== "string" || !session[field].trim()) {
-      return `provider ${provider.id} cliSession requires ${field}`;
-    }
-  }
-  for (const field of ["directory", "file"]) {
-    if (session[field].includes("/") || session[field].includes("\\") || session[field] === "..") {
-      return `provider ${provider.id} cliSession ${field} must be a single path segment`;
-    }
-  }
-  if (session.homeEnv !== undefined && (typeof session.homeEnv !== "string" || !session.homeEnv)) {
-    return `provider ${provider.id} cliSession has an invalid homeEnv`;
-  }
-  return undefined;
-}
-
 function loadRegistry() {
   const parsed = readRegistryDocument();
   if (!Array.isArray(parsed.providers) || !Array.isArray(parsed.models)) {
@@ -202,7 +207,25 @@ function loadRegistry() {
       fail(`OAuth provider ${provider.id} requires proxyBaseEnv`);
     }
     if (provider.kind === "openai-compatible") {
-      if (!/^https?:\/\//.test(provider.baseUrl || "")) {
+      // A per-model-endpoint provider is a container, not a destination: it
+      // has no address, no credential, and nothing to authenticate, because
+      // each of its models carries all three. Letting it also declare them
+      // would create two answers to "where does this go" and a silent winner.
+      if (provider.perModelEndpoint !== undefined) {
+        if (provider.perModelEndpoint !== true) {
+          fail(`provider ${provider.id} has an invalid perModelEndpoint flag`);
+        }
+        if (provider.authMode !== "per-model") {
+          fail(`provider ${provider.id} must declare authMode per-model`);
+        }
+        for (const field of ["baseUrl", "baseUrlEnv", "credential", "keyless", "protocol"]) {
+          if (provider[field] !== undefined) {
+            fail(`per-model-endpoint provider ${provider.id} must not declare ${field}`);
+          }
+        }
+      } else if (provider.authMode === "per-model") {
+        fail(`provider ${provider.id} declares authMode per-model without perModelEndpoint`);
+      } else if (!/^https?:\/\//.test(provider.baseUrl || "")) {
         fail(`provider ${provider.id} requires an HTTP(S) baseUrl`);
       }
       // A keyless provider serves from this machine (a local Ollama or
@@ -222,7 +245,7 @@ function loadRegistry() {
       }
       if (
         provider.authMode !== undefined &&
-        !["anonymous"].includes(provider.authMode)
+        !["anonymous", "per-model"].includes(provider.authMode)
       ) {
         fail(`provider ${provider.id} has an unsupported authMode`);
       }
@@ -237,7 +260,9 @@ function loadRegistry() {
         if (provider.keyless || provider.credential !== undefined) {
           fail(`anonymous provider ${provider.id} must not declare keyless or credential metadata`);
         }
-        if (!["opencode-console", "suffix-free"].includes(provider.anonymousModelPolicy)) {
+        if (
+          !["opencode-console", "suffix-free"].includes(provider.anonymousModelPolicy)
+        ) {
           fail(`anonymous provider ${provider.id} requires a supported anonymousModelPolicy`);
         }
         if (typeof provider.anonymousNote !== "string" || !provider.anonymousNote.trim()) {
@@ -248,7 +273,7 @@ function loadRegistry() {
       }
       if (
         !provider.keyless &&
-        provider.authMode !== "anonymous" &&
+        !["anonymous", "per-model"].includes(provider.authMode) &&
         (!provider.credential?.file || !Array.isArray(provider.credential.environment))
       ) {
         fail(`provider ${provider.id} requires credential metadata`);
@@ -259,8 +284,9 @@ function loadRegistry() {
       ) {
         fail(`provider ${provider.id} has an invalid credential label`);
       }
-      const sessionProblem = cliSessionProblem(provider);
-      if (sessionProblem) fail(sessionProblem);
+      if (provider.credential?.cliSession !== undefined) {
+        fail(`provider ${provider.id} does not support CLI sessions; use an API key`);
+      }
       // Some providers authenticate a credential their plan may still not
       // entitle to the API. The note says so everywhere a user connects, so
       // the first sign of it is not a 403 inside Codex.
@@ -307,15 +333,6 @@ function loadRegistry() {
     if (provider.authProfile !== parent.authProfile) {
       fail(`variant provider ${provider.id} must share ${parent.id}'s auth profile`);
     }
-    // A variant that resolved a different CLI sign-in than its parent would
-    // authenticate one protocol surface and not the other from the same
-    // "connected" state, so the descriptors must match exactly.
-    if (
-      JSON.stringify(provider.credential?.cliSession ?? null) !==
-      JSON.stringify(parent.credential?.cliSession ?? null)
-    ) {
-      fail(`variant provider ${provider.id} must share ${parent.id}'s credential CLI session`);
-    }
   }
 
   const slugs = new Set();
@@ -325,7 +342,7 @@ function loadRegistry() {
     if (problem) fail(problem);
     slugs.add(model.slug);
     gatewayModels.add(model.gatewayModel);
-    return Object.freeze(model);
+    return normalizedModel(model, providers.get(model.provider));
   });
 
   const modelBySlug = new Map(models.map((model) => [model.slug, model]));
@@ -356,6 +373,97 @@ function upgradeTargetProblem(model, modelBySlug) {
   return undefined;
 }
 
+// A model's own endpoint answers the three questions a provider normally
+// answers -- where the request goes, whether it carries a credential, and
+// which one -- so it is validated to the same standard, in the same order, and
+// with the same refusals. Everything an operator can add to `config/custom/`
+// or to their user-model overlay lands here.
+function endpointProblem(model, provider) {
+  if (!provider.perModelEndpoint) {
+    return model.endpoint === undefined
+      ? undefined
+      : `model ${model.slug} declares an endpoint but ${provider.id} is not a per-model-endpoint provider`;
+  }
+  const endpoint = model.endpoint;
+  if (!endpoint || typeof endpoint !== "object" || Array.isArray(endpoint)) {
+    return `model ${model.slug} requires an endpoint under per-model-endpoint provider ${provider.id}`;
+  }
+  if (endpoint.id !== undefined || endpoint.kind !== undefined) {
+    // Both are derived from the model, and a fragment that set them could
+    // point one model's credential file at another model's secret.
+    return `model ${model.slug} endpoint must not declare id or kind`;
+  }
+  if (!/^https?:\/\//.test(endpoint.baseUrl || "")) {
+    return `model ${model.slug} endpoint requires an HTTP(S) baseUrl`;
+  }
+  if (endpoint.authMode !== undefined && endpoint.authMode !== "anonymous") {
+    return `model ${model.slug} endpoint has an unsupported authMode`;
+  }
+  if (endpoint.keyless !== undefined && typeof endpoint.keyless !== "boolean") {
+    return `model ${model.slug} endpoint has an invalid keyless flag`;
+  }
+  // Exactly one auth story per endpoint. Two would leave a silent winner, and
+  // none would send an unauthenticated request to an address nobody vetted.
+  const declared = [
+    endpoint.authMode === "anonymous",
+    Boolean(endpoint.keyless),
+    endpoint.credential !== undefined,
+  ].filter(Boolean).length;
+  if (declared !== 1) {
+    return `model ${model.slug} endpoint must declare exactly one of anonymous, keyless, or credential`;
+  }
+  // The keyless rule is about the address, not the flag: an endpoint that
+  // sends no credential may only talk to this machine.
+  if (endpoint.keyless && !loopbackBaseUrl(endpoint.baseUrl)) {
+    return `model ${model.slug} keyless endpoint must use a loopback baseUrl`;
+  }
+  // An anonymous endpoint reaches a third party with no credential at all, so
+  // the address itself is the security boundary and it lives in code.
+  if (endpoint.authMode === "anonymous") {
+    const expected = ANONYMOUS_MODEL_ENDPOINTS[model.slug];
+    if (!expected || normalizedBaseUrl(endpoint.baseUrl) !== expected) {
+      return `model ${model.slug} anonymous endpoint must use its allowlisted address`;
+    }
+    if (typeof endpoint.note !== "string" || !endpoint.note.trim()) {
+      return `model ${model.slug} anonymous endpoint requires a note`;
+    }
+  }
+  if (
+    endpoint.credential !== undefined &&
+    (!endpoint.credential.file || !Array.isArray(endpoint.credential.environment))
+  ) {
+    return `model ${model.slug} endpoint requires credential metadata`;
+  }
+  if (endpoint.baseUrlEnv !== undefined && typeof endpoint.baseUrlEnv !== "string") {
+    return `model ${model.slug} endpoint has an invalid baseUrlEnv`;
+  }
+  // An override on an endpoint that carries no key would walk straight around
+  // the allowlist the anonymous case just enforced.
+  if (endpoint.baseUrlEnv && (endpoint.authMode === "anonymous" || endpoint.keyless)) {
+    return `model ${model.slug} endpoint must not allow a baseUrl override without a credential`;
+  }
+  return undefined;
+}
+
+// The endpoint the registry declares is data; the endpoint the router resolves
+// has to be provider-shaped so the existing base-URL and credential chains
+// accept it. Identity is derived here rather than read from the fragment.
+function normalizedModel(model, provider) {
+  const officialDisplayName = officialModelDisplayName(model.provider, model.upstreamModel);
+  const presented = officialDisplayName && model.displayName !== officialDisplayName
+    ? { ...model, displayName: officialDisplayName }
+    : model;
+  if (!provider?.perModelEndpoint) return Object.freeze(presented);
+  return Object.freeze({
+    ...presented,
+    endpoint: Object.freeze({
+      ...presented.endpoint,
+      id: presented.slug,
+      kind: "openai-compatible",
+    }),
+  });
+}
+
 // Returns a problem description instead of throwing so the strict registry
 // loader can fail hard while the user-model overlay skips with a warning.
 function modelProblem(model, providers, slugs, gatewayModels) {
@@ -377,8 +485,25 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   if (provider.authMode === "anonymous" && !anonymousModelAllowed(provider, model.upstreamModel)) {
     return `anonymous provider ${provider.id} only accepts its documented free-model ids`;
   }
+  const endpoint = endpointProblem(model, provider);
+  if (endpoint) return endpoint;
+  if (
+    model.behaviorTemplate !== undefined &&
+    (typeof model.behaviorTemplate !== "string" || !model.behaviorTemplate.trim())
+  ) {
+    return `model ${model.slug} has an invalid behaviorTemplate`;
+  }
+  if (model.instructionOverlay !== undefined && !instructionOverlayExists(model.instructionOverlay)) {
+    return `model ${model.slug} has an invalid instructionOverlay`;
+  }
   if (model.requestProfile !== undefined && typeof model.requestProfile !== "string") {
     return `model ${model.slug} has an invalid requestProfile`;
+  }
+  if (
+    model.requiresTrailingUserTurn !== undefined &&
+    typeof model.requiresTrailingUserTurn !== "boolean"
+  ) {
+    return `model ${model.slug} has an invalid requiresTrailingUserTurn flag`;
   }
   if (
     model.multiAgentVersion !== undefined &&
@@ -399,6 +524,21 @@ function modelProblem(model, providers, slugs, gatewayModels) {
     return `model ${model.slug} has an invalid supportsApplyPatchTool`;
   }
   if (
+    model.supportsParallelToolCalls !== undefined &&
+    typeof model.supportsParallelToolCalls !== "boolean"
+  ) {
+    return `model ${model.slug} has an invalid supportsParallelToolCalls`;
+  }
+  if (
+    model.experimentalSupportedTools !== undefined &&
+    (!Array.isArray(model.experimentalSupportedTools) ||
+      model.experimentalSupportedTools.some(
+        (tool) => typeof tool !== "string" || !tool.trim(),
+      ))
+  ) {
+    return `model ${model.slug} has invalid experimentalSupportedTools`;
+  }
+  if (
     model.supportsImageDetailOriginal !== undefined &&
     typeof model.supportsImageDetailOriginal !== "boolean"
   ) {
@@ -411,6 +551,9 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   // never needs it, so only false is accepted.
   if (model.visionBridge !== undefined && model.visionBridge !== false) {
     return `model ${model.slug} may only set visionBridge to false`;
+  }
+  if (model.isFree !== undefined && typeof model.isFree !== "boolean") {
+    return `model ${model.slug} has an invalid isFree flag`;
   }
   // "hosted" means the provider's own backend executes web searches
   // server-side (xAI's Responses proxy today). "standalone" means Codex
@@ -549,6 +692,17 @@ function mergeUserModels(base) {
   const gatewayModels = new Set(models.map((model) => model.gatewayModel));
   const userModels = new Set();
   for (const model of readUserModels()) {
+    // A mutable local overlay may describe routing and presentation, but it
+    // cannot grant itself the repository's native-collaboration certificate.
+    // Local Ollama/LM Studio entries intentionally declare conservative v1 so
+    // they are settled and never spend a cloud compatibility probe. Preserve
+    // that denial, but refuse the positive certificate.
+    if (model?.multiAgentVersion === "v2") {
+      warnings.push(
+        `Skipped user model: model ${model?.slug || "<unknown>"} may not declare multiAgentVersion v2`,
+      );
+      continue;
+    }
     const problem = modelProblem(model, base.providers, slugs, gatewayModels);
     if (problem) {
       warnings.push(`Skipped user model: ${problem}`);
@@ -556,7 +710,7 @@ function mergeUserModels(base) {
     }
     slugs.add(model.slug);
     gatewayModels.add(model.gatewayModel);
-    const frozen = Object.freeze(model);
+    const frozen = normalizedModel(model, base.providers.get(model.provider));
     userModels.add(frozen);
     models.push(frozen);
   }
@@ -579,6 +733,11 @@ const registry = loadRegistry();
 const merged = mergeUserModels(registry);
 
 export const PROVIDERS = registry.providers;
+// The immutable registry shipped by this checkout, before the operator's
+// mutable user-model overlay is merged. Repository certification gates must
+// bind to this set: a local overlay is useful routing configuration, but it
+// cannot certify itself for every installer.
+export const CHECKED_IN_MODELS = registry.models;
 export const MODELS = merged.models;
 export const USER_MODEL_WARNINGS = merged.warnings;
 export const LISTED_MODELS = Object.freeze(MODELS.filter((model) => model.listed));

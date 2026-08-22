@@ -303,7 +303,31 @@ export function commandCodeCreditsMetrics(payload) {
       "credits",
     );
   };
+  // The window caps say how fast the plan may be spent; the credit pool says
+  // how much is left to spend at all. A coding plan runs out of the second one
+  // long before it stops hitting the first, so reporting only the windows
+  // hides the number that actually ends someone's afternoon.
+  const credits = payload?.credits;
+  const monthly = numberValue(credits?.monthlyCredits);
+  const purchased = numberValue(credits?.purchasedCredits);
+  const free = numberValue(credits?.freeCredits);
+  const total = [monthly, purchased, free].filter(Number.isFinite).reduce((sum, part) => sum + part, 0);
+  const balance = Number.isFinite(monthly)
+    ? [{
+        kind: "balance",
+        label: "Plan credits",
+        value: total,
+        currency: "USD",
+        detail: [
+          Number.isFinite(monthly) ? `Plan ${monthly.toFixed(2)}` : undefined,
+          Number.isFinite(purchased) && purchased > 0 ? `Purchased ${purchased.toFixed(2)}` : undefined,
+          Number.isFinite(free) && free > 0 ? `Free ${free.toFixed(2)}` : undefined,
+        ].filter(Boolean).join(" · "),
+        available: credits?.belowThreshold !== true,
+      }]
+    : [];
   return [
+    ...balance,
     windowMetric("5-hour limit", windows.fiveHour),
     windowMetric("Weekly limit", windows.weekly),
   ].filter(Boolean);
@@ -674,9 +698,8 @@ async function zaiCodingAccount(fetchImpl) {
   return account;
 }
 
-// The credits route is the one the official Command Code CLI polls; it is
-// not in the public docs, so any failure degrades to the Studio link and
-// observed router traffic instead of an error state.
+// The credits route is not in the public docs, so any failure degrades to the
+// Studio link and observed router traffic instead of an error state.
 async function commandCodeAccount(fetchImpl) {
   const provider = PROVIDERS.get("commandcode");
   const credential = resolveProviderCredential(provider);
@@ -784,7 +807,10 @@ async function accountUsageFor(providerId, fetchImpl) {
     if (providerId === "commandcode") return await commandCodeAccount(fetchImpl);
     if (providerId === "minimax-token-plan") return await minimaxTokenPlanAccount(fetchImpl);
     if (providerId === "opencode-go") return await opencodeGoAccount(fetchImpl);
-    if (providerId === "opencode-free" || providerId === "kilo-free") {
+    // Keyed on the auth mode rather than on a list of ids: an anonymous
+    // provider has no account to query by construction, so a new one must not
+    // be able to fall through to a branch that would try.
+    if (["anonymous", "per-model"].includes(PROVIDERS.get(providerId)?.authMode)) {
       return withHeaderQuota(providerId, localOnly("Anonymous free-provider quota is not exposed; showing router traffic"));
     }
     if (providerId === "github-copilot") return await githubCopilotAccount(fetchImpl);

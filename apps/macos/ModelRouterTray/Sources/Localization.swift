@@ -10,6 +10,10 @@ enum TrayLanguage: String, CaseIterable, Identifiable {
   case system
   case english
   case chinese
+  case arabic
+  case hindi
+  case japanese
+  case korean
 
   var id: String { rawValue }
 
@@ -25,10 +29,47 @@ enum TrayLanguage: String, CaseIterable, Identifiable {
   var label: String {
     switch self {
     case .system:
-      let resolved = RouterLanguage.systemPrefersChinese ? "中文" : "English"
-      return "\(routerLocalized("System")) · \(resolved)"
+      return "\(routerLocalized("System")) · \(RouterLanguage.systemResolution.nativeName)"
     case .english: return "English"
     case .chinese: return "中文"
+    case .arabic: return "العربية"
+    case .hindi: return "हिन्दी"
+    case .japanese: return "日本語"
+    case .korean: return "한국어"
+    }
+  }
+}
+
+/// A concrete language the tray can render in: `TrayLanguage` minus `system`,
+/// which resolves to one of these.
+enum ResolvedTrayLanguage {
+  case english
+  case chinese
+  case arabic
+  case hindi
+  case japanese
+  case korean
+
+  var nativeName: String {
+    switch self {
+    case .english: return "English"
+    case .chinese: return "中文"
+    case .arabic: return "العربية"
+    case .hindi: return "हिन्दी"
+    case .japanese: return "日本語"
+    case .korean: return "한국어"
+    }
+  }
+
+  /// English is the source text itself, so it carries no table.
+  var table: [String: String]? {
+    switch self {
+    case .english: return nil
+    case .chinese: return RouterChineseText.values
+    case .arabic: return RouterArabicText.values
+    case .hindi: return RouterHindiText.values
+    case .japanese: return RouterJapaneseText.values
+    case .korean: return RouterKoreanText.values
     }
   }
 }
@@ -48,18 +89,33 @@ enum RouterLanguage {
     UserDefaults.standard.set(next.rawValue, forKey: storageKey)
   }
 
-  static var systemPrefersChinese: Bool {
-    let preferred = Locale.preferredLanguages.first ?? Locale.current.identifier
-    return preferred.lowercased().hasPrefix("zh")
+  static var systemResolution: ResolvedTrayLanguage {
+    let preferred = (Locale.preferredLanguages.first ?? Locale.current.identifier).lowercased()
+    if preferred.hasPrefix("zh") { return .chinese }
+    if preferred.hasPrefix("ar") { return .arabic }
+    if preferred.hasPrefix("hi") { return .hindi }
+    if preferred.hasPrefix("ja") { return .japanese }
+    if preferred.hasPrefix("ko") { return .korean }
+    return .english
   }
 
-  static var isSimplifiedChinese: Bool {
+  static var systemPrefersChinese: Bool { systemResolution == .chinese }
+
+  static var resolution: ResolvedTrayLanguage {
     switch selection {
-    case .system: return systemPrefersChinese
-    case .english: return false
-    case .chinese: return true
+    case .system: return systemResolution
+    case .english: return .english
+    case .chinese: return .chinese
+    case .arabic: return .arabic
+    case .hindi: return .hindi
+    case .japanese: return .japanese
+    case .korean: return .korean
     }
   }
+
+  /// Kept for the call sites that compose Chinese strings inline; those fall
+  /// back to English in every other translated language.
+  static var isSimplifiedChinese: Bool { resolution == .chinese }
 }
 
 /// Small, dependency-free localization layer for strings rendered by the
@@ -67,8 +123,7 @@ enum RouterLanguage {
 /// fallback, so a newly added string is still usable before its translation is
 /// added.
 func routerLocalized(_ english: String) -> String {
-  guard RouterLanguage.isSimplifiedChinese else { return english }
-  return RouterChineseText.values[english] ?? english
+  RouterLanguage.resolution.table?[english] ?? english
 }
 
 func routerFormat(_ english: String, _ arguments: CVarArg...) -> String {
@@ -183,6 +238,7 @@ enum RouterChineseText {
     "External providers · Codex restarts automatically": "外部提供商 · Codex 会自动重启",
     "Use connected models and restart Codex": "使用已连接模型并重启 Codex",
     "Compact old tool results": "压缩旧工具结果",
+    "Effort as subagent": "作为子代理的思考强度",
     "Forced off by CODEX_ROUTER_TOOL_RESULT_AGING=0": "已被 CODEX_ROUTER_TOOL_RESULT_AGING=0 强制关闭",
     "External models · applies on the next request": "外部模型 · 下次请求生效",
     "Providers": "提供商",
@@ -196,6 +252,7 @@ enum RouterChineseText {
     "Subagent choices do not hide models from Codex's picker — use Model picker below for that.": "子代理选择不会隐藏 Codex 选择器中的模型；如需隐藏模型，请使用下面的模型选择器。",
     "Hidden models stay connected but are not offered by Codex.": "隐藏的模型仍保持连接，但不会提供给 Codex。",
     "Run models locally through Ollama. Enable an installed model to make it available to Codex.": "通过 Ollama 在本地运行模型。启用已安装的模型即可提供给 Codex。",
+    "Run local models through Ollama or the curated MLX runtime. Installed models are wired into the same Codex proxy.": "通过 Ollama 或精选的 MLX 运行时在本地运行模型。已安装的模型会接入同一个 Codex 代理。",
     "Nothing installed yet. Start with a quick pick or browse the Ollama catalog below.": "尚未安装模型。请选择快速选项，或浏览下面的 Ollama 目录。",
     "Install a model": "安装模型",
     "Install": "安装",
@@ -395,6 +452,8 @@ enum RouterChineseText {
     "5-hour limit": "5 小时限制",
     "Hidden from picker — show it below to use it here": "已从选择器隐藏 — 请在下方显示后才能使用",
     "Proven v2": "已验证 v2",
+    "v1 only": "仅支持 v1",
+    "Certification candidate": "认证候选",
     "Not selected": "未选择",
     "Apply the checked-out router revision, then run the Codex doctor": "应用已检出的路由版本，然后运行 Codex doctor",
     "Run the Codex doctor and repair managed router files": "运行 Codex doctor 并修复受管理的路由文件",
@@ -412,5 +471,46 @@ enum RouterChineseText {
     "High": "高",
     "Model provider": "模型提供商",
     "Resets": "重置时间",
+    "Menu bar mode": "菜单栏模式",
+    "Standard": "标准模式",
+    "Icon only": "仅图标",
+    "Compact icon only, no model name text": "仅显示紧凑图标，隐藏模型名称文本",
+    "Show icon, model name, and usage": "显示图标、模型名称及用量",
+    "Show model name": "显示模型名称",
+    "Current model or provider is visible in menu bar": "在菜单栏中显示当前模型或提供商名称",
+    "Hide model name text in menu bar": "在菜单栏中隐藏模型名称文本",
+    "Menu bar icon": "菜单栏图标",
+    "Provider icon": "提供商图标",
+    "Activity dot": "活动状态点",
+    "Preset icon": "预设图标",
+    "Custom image": "自定义图片",
+    "Choose the icon displayed in the menu bar": "选择菜单栏中显示的图标",
+    "Choose Image…": "选择图片…",
+    "No custom image selected": "未选择自定义图片",
+    "Custom image missing": "自定义图片已丢失",
+    "Codex Router · %@ (%@) · %@": "Codex Router · %@ (%@) · %@",
+    "Codex Router · %@ (%@)": "Codex Router · %@ (%@)",
+    "Select": "选择",
+    // Service health panel. The state words are shared with the Control
+    // Center's panel, so they are translated as the same vocabulary: a row is
+    // Ready/Standby/Degraded/Offline and its detail says why.
+    "Service health": "服务健康",
+    "Checking": "检查中",
+    "All clear": "一切正常",
+    "Serving locally": "正在本地提供服务",
+    "Degraded": "降级",
+    "Offline": "离线",
+    "Health endpoint unavailable": "健康检查端点不可用",
+    "Unknown": "未知",
+    "Waiting for health report": "等待健康报告",
+    "Standby": "待命",
+    "Not enabled": "未启用",
+    "Unreachable": "无法连接",
+    "Reachable": "可连接",
+    "External forwarders": "外部转发器",
+    // Composed as "\(effort) \(thinking)", so this follows the effort word.
+    // "思考强度" is the vocabulary already used for effort elsewhere here.
+    "Subagent": "子代理",
+    "thinking": "思考强度",
   ]
 }

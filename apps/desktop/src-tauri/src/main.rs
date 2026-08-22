@@ -120,6 +120,7 @@ fn main() {
             uninstall_local_model,
             cancel_local_model,
             set_local_model_enabled,
+            set_lmstudio_model_enabled,
             install_provider_cli,
             connect_oauth,
             save_api_key,
@@ -288,10 +289,16 @@ fn desktop_settings(state: State<'_, RouterState>) -> Result<DesktopSettings, St
 }
 
 #[tauri::command]
-async fn router_health() -> Value {
-    tauri::async_runtime::spawn_blocking(read_router_health)
-        .await
-        .unwrap_or_else(|_| offline_health("Router health check did not finish."))
+async fn router_health(state: State<'_, RouterState>) -> Result<Value, String> {
+    // `control health` reads the protected router health leaf with the local
+    // caller capability and projects away credential metadata. The public
+    // `/health` endpoint intentionally carries only the degraded names.
+    run_json_command(
+        state.inner().clone(),
+        vec!["health".into(), "--json".into()],
+        None,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -560,6 +567,26 @@ async fn set_local_model_enabled(
 }
 
 #[tauri::command]
+async fn set_lmstudio_model_enabled(
+    state: State<'_, RouterState>,
+    model: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    validate_lmstudio_model_id(&model)?;
+    run_json_command(
+        state.inner().clone(),
+        vec![
+            "local-models".into(),
+            "lmstudio-set".into(),
+            model,
+            (if enabled { "on" } else { "off" }).into(),
+        ],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
 async fn install_provider_cli(
     state: State<'_, RouterState>,
     provider: String,
@@ -608,27 +635,20 @@ async fn save_api_key(
             &["credential", &provider],
             Some(api_key.as_bytes()),
         )?;
-        update_provider_selection(&router, &provider, true)?;
         run_control_json(&router, &["providers", "--json"], None)
     })
     .await
     .map_err(|_| "The credential operation did not finish.".to_string())?
 }
 
-// The control plane already drops the provider from the Codex selection when a
-// key file is deleted, so this only has to make that selection live.
+// The credential command removes the key, disables the provider, and publishes
+// the resulting selection under one model-overlay lock.
 #[tauri::command]
 async fn remove_api_key(state: State<'_, RouterState>, provider: String) -> Result<Value, String> {
     validate_provider_kind(&provider, ProviderKind::Api)?;
     let router = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let removal = run_control_json(&router, &["credential", &provider, "--remove"], None)?;
-        let _ = run_control(
-            &router,
-            &["apply", "--targets", "codex", "--activate"],
-            None,
-        );
-        Ok(removal)
+        run_control_json(&router, &["credential", &provider, "--remove"], None)
     })
     .await
     .map_err(|_| "The credential removal did not finish.".to_string())?
@@ -920,29 +940,19 @@ fn update_provider_selection(
     provider: &str,
     enabled: bool,
 ) -> Result<(), String> {
-    let overview = run_control_json(state, &["--json"], None)?;
-    let was_enabled = overview
-        .pointer("/targets/codex/enabledProviders")
-        .and_then(Value::as_array)
-        .map(|providers| providers.iter().any(|item| item.as_str() == Some(provider)))
-        .unwrap_or(false);
     let desired = if enabled { "on" } else { "off" };
     run_control(
         state,
-        &["set", provider, desired, "--targets", "codex"],
+        &[
+            "set-apply",
+            provider,
+            desired,
+            "--targets",
+            "codex",
+            "--activate",
+        ],
         None,
     )?;
-
-    if let Err(error) = run_control(state, &["apply", "--targets", "codex", "--activate"], None) {
-        let previous = if was_enabled { "on" } else { "off" };
-        let _ = run_control(
-            state,
-            &["set", provider, previous, "--targets", "codex"],
-            None,
-        );
-        let _ = run_control(state, &["apply", "--targets", "codex", "--activate"], None);
-        return Err(error);
-    }
     Ok(())
 }
 
@@ -1411,6 +1421,28 @@ fn validate_local_model_ref(model: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("Enter a valid Ollama model tag or model-page URL.".into())
+    }
+}
+
+/// Same character discipline as the Node-side `requireTag` (an id reaches a
+/// command line either way), with an error that names LM Studio instead of
+/// telling an LM Studio user their id is not a valid Ollama tag.
+fn validate_lmstudio_model_id(model: &str) -> Result<(), String> {
+    let trimmed = model.trim();
+    let valid = !trimmed.is_empty()
+        && trimmed.len() <= 128
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '-'))
+        && !trimmed.starts_with('-');
+    if valid {
+        Ok(())
+    } else {
+        Err("Enter a valid LM Studio model id.".into())
     }
 }
 

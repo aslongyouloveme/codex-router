@@ -101,3 +101,68 @@ test("does not split surrogate pairs at either preview boundary", () => {
   assert.doesNotMatch(result.input[1].output, /�/);
   assert.equal((result.input[1].output.match(/😀/gu) || []).length, 2);
 });
+
+// The failure this instrumentation exists for: a session that spends its whole
+// context on results which each sit under the floor reported the same empty
+// stats as a pass that never ran, so an operator could not tell an ineffective
+// feature from an unloaded one.
+test("a pass that ages nothing still reports what it evaluated and the largest result it saw", () => {
+  const input = [
+    ...Array.from({ length: 12 }, (_, index) => [
+      call(`mid-${index}`),
+      output(`mid-${index}`, "x".repeat(12_000)),
+      { type: "message", role: "assistant", content: `read ${index}` },
+    ]).flat(),
+  ];
+  const { stats, input: unchanged } = ageToolResults(input);
+  assert.equal(stats.toolResultsAged, 0);
+  assert.equal(stats.toolResultsEvaluated, 8, "the four newest results stay protected");
+  assert.equal(stats.toolResultBytesLargest, 12_000);
+  assert.equal(unchanged, input, "nothing qualified, so the input is passed through by reference");
+});
+
+test("a disabled pass stays distinguishable from one that ran and found nothing", () => {
+  const input = [call("a"), output("a", "x".repeat(12_000))];
+  const off = ageToolResults(input, { enabled: false });
+  assert.equal(off.stats.toolResultsEvaluated, undefined);
+  assert.equal(off.stats.toolResultBytesLargest, undefined);
+  const on = ageToolResults(input);
+  assert.equal(on.stats.toolResultsEvaluated, 0, "every result here sits inside the frontier");
+});
+
+// Reported alongside #256: the 400 was seen with "Compact old tool results"
+// switched on, so the pass had to be cleared of rewriting the reasoning that
+// a thinking provider demands back. It only ever replaces the `output` of a
+// tool result; reasoning items and assistant messages come out by reference.
+test("a pass that ages a result leaves the reasoning and assistant turns around it untouched", () => {
+  const reasoning = {
+    type: "reasoning",
+    id: "rs_1",
+    summary: [{ type: "summary_text", text: "The user wants the log tail." }],
+    content: null,
+  };
+  const answer = {
+    type: "message",
+    role: "assistant",
+    content: [{ type: "output_text", text: "Here is what the log says." }],
+  };
+  const input = [
+    reasoning,
+    call("old", "exec_command"),
+    output("old", `HEAD\n${"middle\n".repeat(8_000)}TAIL`),
+    answer,
+    ...Array.from({ length: 4 }, (_, index) => [
+      call(`new-${index}`),
+      output(`new-${index}`, "small"),
+    ]).flat(),
+  ];
+
+  const result = ageToolResults(input);
+  assert.equal(result.stats.toolResultsAged, 1, "the old result did qualify");
+  assert.equal(result.input[0], reasoning, "the reasoning item is passed through by reference");
+  assert.equal(result.input[3], answer, "the assistant turn is passed through by reference");
+  assert.deepEqual(
+    result.input.filter((item) => item.type === "reasoning"),
+    [reasoning],
+  );
+});

@@ -17,10 +17,12 @@ const { renderLiteLlmConfig } = await import("../src/litellm-config.mjs");
 const {
   API_MODELS,
   anonymousModelAllowed,
+  endpointForModel,
   LISTED_MODELS,
   MODEL_BY_SLUG,
   MODELS,
   PROVIDERS,
+  providerNeedsNoKey,
   readRegistryDocument,
   resolveProviderBaseUrl,
 } = await import("../src/model-registry.mjs");
@@ -82,7 +84,9 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/qwen3.7-plus",
       "commandcode/qwen3.8-max",
       "commandcode/step-3.7-flash",
+      "custom/qwen3.8-27b",
       "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-flash-vision-exp",
       "deepseek/deepseek-v4-pro",
       "grok-api/grok-4.5",
       "grok-oauth/grok-4.5",
@@ -120,6 +124,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "opencode-go-messages/qwen3.7-plus",
       "opencode-go-messages/qwen3.8-max",
       "opencode-go-responses/gpt-5.6-luna",
+      "opencode-go-responses/muse-spark-1.2-contributor",
       "qwen-plan/deepseek-v4-flash-0731",
       "qwen-plan/deepseek-v4-pro-0813",
       "qwen-plan/deepseek-v4-pro",
@@ -129,12 +134,13 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "qwen-plan/qwen3.7-plus",
       "qwen-plan/qwen3.8-max-preview",
       "qwen-plan/qwen3.8-max",
+      "xiaomi-mimo/mimo-v2.5-pro",
+      "xiaomi-mimo/mimo-v2.5",
       "zai-api/glm-4.7",
       "zai-api/glm-5.2",
       "zai-api/glm-5.3",
       "zai-coding/glm-5-turbo",
       "zai-coding/glm-5.2",
-      "zai-coding/glm-5.3-1m",
       "zai-coding/glm-5.3",
     ],
   );
@@ -185,6 +191,12 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(PROVIDERS.get("commandcode").baseUrl, "https://api.commandcode.ai/provider/v1");
   assert.equal(PROVIDERS.get("commandcode-messages").baseUrl, "https://api.commandcode.ai/provider/v1");
   assert.equal(PROVIDERS.get("commandcode-messages").protocol, "anthropic");
+  // Xiaomi's direct API is OpenAI-compatible chat, not the Responses gateway.
+  assert.equal(PROVIDERS.get("xiaomi-mimo").baseUrl, "https://api.xiaomimimo.com/v1");
+  assert.equal(PROVIDERS.get("xiaomi-mimo").baseUrlEnv, "XIAOMI_MIMO_API_BASE_URL");
+  assert.equal(PROVIDERS.get("xiaomi-mimo").protocol, "openai");
+  assert.deepEqual(PROVIDERS.get("xiaomi-mimo").credential.environment, ["MIMO_API_KEY"]);
+  assert.equal(PROVIDERS.get("xiaomi-mimo").credential.file, "xiaomi-mimo-api-key.secret");
   // The protocol variants are one selectable family: they declare the parent
   // whose credential and picker selection they follow.
   assert.equal(PROVIDERS.get("opencode-go").variantOf, undefined);
@@ -264,6 +276,42 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(kiloFree.baseUrl, "https://api.kilo.ai/api/gateway");
   assert.equal(anonymousModelAllowed(kiloFree, "z-ai/glm-5:free"), true);
   assert.equal(anonymousModelAllowed(kiloFree, "z-ai/glm-5"), false);
+  // The `custom` provider is a container: it has no address, no credential, and
+  // nothing to authenticate, because each of its models carries all three.
+  const custom = PROVIDERS.get("custom");
+  assert.equal(custom.perModelEndpoint, true);
+  assert.equal(custom.authMode, "per-model");
+  assert.equal(custom.baseUrl, undefined);
+  assert.equal(custom.baseUrlEnv, undefined);
+  assert.equal(custom.credential, undefined);
+  assert.equal(providerNeedsNoKey(custom), true);
+  // Its first model names the free community endpoint and reaches it with no
+  // credential, so the address is the security boundary and lives in code.
+  const customModels = LISTED_MODELS.filter(({ provider }) => provider === "custom");
+  assert.deepEqual(
+    customModels.map(({ slug }) => slug),
+    ["custom/qwen3.8-27b"],
+  );
+  const [qwen38] = customModels;
+  assert.equal(
+    qwen38.endpoint.baseUrl,
+    "https://g9hnto0u7lvbu837.us-east-2.aws.endpoints.huggingface.cloud/v1",
+  );
+  assert.equal(qwen38.endpoint.authMode, "anonymous");
+  assert.equal(qwen38.endpoint.credential, undefined);
+  assert.equal(qwen38.endpoint.baseUrlEnv, undefined);
+  // Identity is derived from the model, never read from the fragment, so one
+  // model's credential file can never be pointed at another model's secret.
+  assert.equal(qwen38.endpoint.id, "custom/qwen3.8-27b");
+  assert.equal(qwen38.endpoint.kind, "openai-compatible");
+  assert.equal(endpointForModel(qwen38), qwen38.endpoint);
+  // Metadata verified against the live endpoint rather than guessed.
+  assert.equal(qwen38.contextWindow, 262144);
+  assert.deepEqual(qwen38.inputModalities, ["text", "image"]);
+  assert.equal(qwen38.requestProfile, "qwen38-community");
+  // Every other provider is its own endpoint, so the two answers coincide.
+  const deepseekModel = LISTED_MODELS.find(({ provider }) => provider === "deepseek");
+  assert.equal(endpointForModel(deepseekModel), PROVIDERS.get("deepseek"));
   const clinepass = PROVIDERS.get("clinepass");
   assert.equal(clinepass.baseUrl, "https://api.cline.bot/api/v1");
   assert.equal(clinepass.baseUrlEnv, "CLINE_API_BASE_URL");
@@ -381,7 +429,10 @@ test("provider registry exposes configured API and OAuth model families", () => 
   }
   const standaloneSearchSlugs = new Set([
     "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
+    "xiaomi-mimo/mimo-v2.5",
+    "zai-coding/glm-5.3",
   ]);
   for (const model of MODELS) {
     if (["grok-oauth/grok-4.5", "grok-oauth/grok-4.6"].includes(model.slug) || standaloneSearchSlugs.has(model.slug)) continue;
@@ -395,6 +446,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
   ).map((model) => model.slug);
   assert.deepEqual(originalDetailSlugs.sort(), [
     "anthropic-api/claude-opus-4.8",
+    "deepseek/deepseek-v4-flash-vision-exp",
     "grok-api/grok-4.5",
     "grok-oauth/grok-4.5",
     "grok-oauth/grok-4.6",
@@ -408,6 +460,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
     "qwen-plan/qwen3.7-max",
     "qwen-plan/qwen3.8-max",
     "qwen-plan/qwen3.8-max-preview",
+    "xiaomi-mimo/mimo-v2.5",
   ]);
   for (const slug of originalDetailSlugs) {
     assert.ok(
@@ -457,23 +510,91 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(grok46.defaultEffort, "high");
   assert.deepEqual(grok46.inputModalities, ["text", "image"]);
   for (const slug of [
+    "grok-oauth/grok-4.6",
+    "grok-oauth/grok-4.5",
+    "grok-api/grok-4.5",
     "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-reasoner",
+  ]) {
+    assert.equal(MODEL_BY_SLUG.get(slug).supportsReasoningSummaries, true);
+  }
+  assert.equal(MODEL_BY_SLUG.get("deepseek/deepseek-chat").supportsReasoningSummaries, undefined);
+  for (const slug of [
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-pro",
   ]) {
     const model = MODEL_BY_SLUG.get(slug);
     assert.equal(model.contextWindow, 1_048_576);
+    assert.equal(model.autoCompact, 900_000);
     assert.match(model.description, /DeepSeek V4/);
-    assert.deepEqual(model.inputModalities, ["text"]);
   }
+  assert.deepEqual(
+    MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash").inputModalities,
+    ["text"],
+  );
+  assert.deepEqual(
+    MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").inputModalities,
+    ["text"],
+  );
+  assert.deepEqual(
+    MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash-vision-exp").inputModalities,
+    ["text", "image"],
+  );
+});
+
+test("only checked-in Gemini reseller models opt into trailing model-turn trimming", () => {
+  assert.equal(
+    MODEL_BY_SLUG.get("commandcode/gemini-3.5-flash").requiresTrailingUserTurn,
+    true,
+  );
+  assert.equal(
+    MODEL_BY_SLUG.get("commandcode/gemini-3.7-flash").requiresTrailingUserTurn,
+    true,
+  );
+  assert.equal(MODEL_BY_SLUG.get("commandcode/gpt-5.5").requiresTrailingUserTurn, undefined);
 });
 
 test("DeepSeek V4 Flash routes opt in to Codex standalone web search", () => {
   for (const slug of [
     "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
   ]) {
     assert.deepEqual(MODEL_BY_SLUG.get(slug)?.searchTool, { mode: "standalone" }, slug);
   }
+});
+
+test("DeepSeek V4 Flash Vision Exp advertises only verified direct-API capabilities", () => {
+  const model = MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash-vision-exp");
+  assert.ok(model);
+  assert.equal(model.provider, "deepseek");
+  assert.equal(model.gatewayModel, "deepseek-v4-flash-vision-exp");
+  assert.equal(model.upstreamModel, "deepseek-v4-flash-vision-exp");
+  assert.equal(model.listed, true);
+  assert.equal(model.requestProfile, "deepseek-thinking");
+  assert.equal(model.defaultEffort, "high");
+  assert.deepEqual(
+    model.reasoningLevels.map((level) => level.effort),
+    ["low", "high", "max"],
+  );
+  assert.equal(model.contextWindow, 1_048_576);
+  assert.equal(model.autoCompact, 900_000);
+  assert.deepEqual(model.inputModalities, ["text", "image"]);
+  assert.equal(model.supportsImageDetailOriginal, true);
+  assert.deepEqual(model.searchTool, { mode: "standalone" });
+  assert.equal(model.supportsReasoningSummaries, true);
+  assert.equal(endpointForModel(model), PROVIDERS.get("deepseek"));
+  assert.ok(API_MODELS.includes(model));
+});
+
+test("GLM-5.3 Coding Plan opts in to GPT-5.6 behavior, concise execution, and standalone search", () => {
+  const model = MODEL_BY_SLUG.get("zai-coding/glm-5.3");
+  assert.equal(model?.behaviorTemplate, "gpt-5.6-sol");
+  assert.equal(model?.instructionOverlay, "efficient-agentic");
+  assert.deepEqual(model?.searchTool, { mode: "standalone" });
 });
 
 test("Meta models opt out of the apply_patch custom tool", () => {
@@ -485,6 +606,33 @@ test("Meta models opt out of the apply_patch custom tool", () => {
     assert.equal(MODEL_BY_SLUG.get(slug).supportsApplyPatchTool, false);
   }
   assert.equal(MODEL_BY_SLUG.get("grok-oauth/grok-4.5").supportsApplyPatchTool, undefined);
+});
+
+test("official Xiaomi MiMo routes advertise only verified capabilities", () => {
+  const vlm = MODEL_BY_SLUG.get("xiaomi-mimo/mimo-v2.5");
+  const pro = MODEL_BY_SLUG.get("xiaomi-mimo/mimo-v2.5-pro");
+  for (const model of [pro, vlm]) {
+    assert.equal(model.contextWindow, 1_048_576);
+    // 900,000 is what every other million-token route in this registry
+    // compacts at, including the three other MiMo routes. The 95% this
+    // started at left ~52K of headroom on a window Codex is already told to
+    // treat as 95% effective, so a turn could grow past the limit before
+    // anything compacted it.
+    assert.equal(model.autoCompact, 900_000);
+    assert.equal(model.defaultEffort, "high");
+    assert.deepEqual(model.reasoningLevels, [
+      { effort: "high", description: "Deep reasoning" },
+    ]);
+    assert.equal(model.supportsReasoningSummaries, true);
+    assert.equal(model.supportsParallelToolCalls, false);
+    assert.deepEqual(model.experimentalSupportedTools, []);
+    assert.equal(model.supportsApplyPatchTool, false);
+  }
+  assert.deepEqual(pro.inputModalities, ["text"]);
+  assert.equal(pro.searchTool, undefined);
+  assert.deepEqual(vlm.inputModalities, ["text", "image"]);
+  assert.equal(vlm.supportsImageDetailOriginal, true);
+  assert.deepEqual(vlm.searchTool, { mode: "standalone" });
 });
 
 test("deprecated DeepSeek aliases remain routable but stay out of the picker", () => {
@@ -552,6 +700,19 @@ test("the gateway config disables deployment cooldowns", () => {
   assert.equal(new Set(names).size, names.length, "one deployment per model_name");
 });
 
+test("only Z.ai Coding Plan model groups disable LiteLLM rate-limit retries", () => {
+  const rendered = renderLiteLlmConfig();
+  for (const model of MODELS.filter(({ provider }) => provider === "zai-coding")) {
+    assert.match(
+      rendered,
+      new RegExp(`${model.gatewayModel}:\\n\\s+RateLimitErrorRetries: 0`),
+      model.slug,
+    );
+  }
+  assert.doesNotMatch(rendered, /^  retry_policy:/m);
+  assert.doesNotMatch(rendered, /zai-api-glm-5-3:\n\s+RateLimitErrorRetries: 0/);
+});
+
 test("LiteLLM configuration is generated from every registry route", () => {
   const rendered = renderLiteLlmConfig();
   for (const model of MODELS) {
@@ -611,6 +772,32 @@ test("curated upgrade prompts point at listed generational successors", () => {
   );
 });
 
+test("instruction overlays must name a shipped overlay", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(path.join(tmpdir(), "registry-overlay-test-"));
+  try {
+    const registry = readRegistryDocument("config");
+    registry.models = [
+      { ...registry.models[0], instructionOverlay: "no-such-overlay" },
+      ...registry.models.slice(1),
+    ];
+    const registryPath = path.join(dir, "providers.json");
+    writeFileSync(registryPath, JSON.stringify(registry));
+    const result = spawnSync(
+      process.execPath,
+      ["-e", "import('./src/model-registry.mjs').catch((e)=>{console.error(e.message);process.exit(1);})"],
+      { encoding: "utf8", env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath } },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /invalid instructionOverlay/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // The router's vision bridge is what gives a text-only model images, so the
 // registry may only record an opt-out. A `true` would read as a capability the
 // model itself has, which is exactly the claim the bridge must never make.
@@ -635,6 +822,32 @@ test("visionBridge may only be set to false", async () => {
     );
     assert.equal(result.status, 1);
     assert.match(result.stderr, /may only set visionBridge to false/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("requiresTrailingUserTurn must be a boolean", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(path.join(tmpdir(), "registry-trailing-turn-test-"));
+  try {
+    const registry = readRegistryDocument("config");
+    registry.models = [
+      { ...registry.models[0], requiresTrailingUserTurn: "yes" },
+      ...registry.models.slice(1),
+    ];
+    const registryPath = path.join(dir, "providers.json");
+    writeFileSync(registryPath, JSON.stringify(registry));
+    const result = spawnSync(
+      process.execPath,
+      ["-e", "import('./src/model-registry.mjs').catch((e)=>{console.error(e.message);process.exit(1);})"],
+      { encoding: "utf8", env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath } },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /invalid requiresTrailingUserTurn flag/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -702,6 +915,31 @@ test("serviceTiers require unique non-empty ids and names", async () => {
   }
 });
 
+test("isFree is a boolean model tag", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const nodePath = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(nodePath.join(tmpdir(), "registry-free-tag-test-"));
+  const load = (isFree) => {
+    const registry = readRegistryDocument("config");
+    registry.models = [{ ...registry.models[0], isFree }, ...registry.models.slice(1)];
+    const registryPath = nodePath.join(dir, "providers.json");
+    writeFileSync(registryPath, JSON.stringify(registry));
+    return spawnSync(
+      process.execPath,
+      ["-e", "import('./src/model-registry.mjs').catch((e)=>{console.error(e.message);process.exit(1);})"],
+      { encoding: "utf8", env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath } },
+    );
+  };
+  try {
+    assert.match(load("yes").stderr, /invalid isFree flag/);
+    assert.equal(load(true).status, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // A keyless provider skips the credential requirement, which is only safe
 // because it cannot reach off-box. Both halves of that bargain are enforced.
 test("a keyless provider must be loopback and must not carry a credential", async () => {
@@ -746,7 +984,7 @@ test("a keyless provider must be loopback and must not carry a credential", asyn
   }
 });
 
-test("anonymous providers are fixed official endpoints without credentials", async () => {
+test("credential-free endpoints are allowlisted addresses, at the provider and at the model", async () => {
   const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const nodePath = (await import("node:path")).default;
@@ -783,6 +1021,100 @@ test("anonymous providers are fixed official endpoints without credentials", asy
     });
     assert.equal(keyed.status, 1);
     assert.match(keyed.stderr, /anonymous provider kilo-free must not declare keyless or credential metadata/);
+
+    // Everything below is the same guarantee one level down. A per-model
+    // endpoint moves the address out of the provider and into the model, so a
+    // JSON fragment is the thing that must not be able to widen it.
+    const customModel = (mutate) => (registry) => {
+      registry.models = registry.models.map((model) =>
+        model.provider === "custom" ? mutate(model) : model,
+      );
+    };
+
+    // The address is the security boundary for a credential-free endpoint, so
+    // it is allowlisted in code and a fragment cannot repoint it.
+    const redirectedModel = load(customModel((model) => ({
+      ...model,
+      endpoint: { ...model.endpoint, baseUrl: "https://example.com/v1" },
+    })));
+    assert.equal(redirectedModel.status, 1);
+    assert.match(
+      redirectedModel.stderr,
+      /model custom\/qwen3\.8-27b anonymous endpoint must use its allowlisted address/,
+    );
+
+    // An environment override would walk straight around that allowlist.
+    const overridden = load(customModel((model) => ({
+      ...model,
+      endpoint: { ...model.endpoint, baseUrlEnv: "CUSTOM_BASE_URL" },
+    })));
+    assert.equal(overridden.status, 1);
+    assert.match(
+      overridden.stderr,
+      /must not allow a baseUrl override without a credential/,
+    );
+
+    // Exactly one auth story per endpoint: two would leave a silent winner.
+    const doubled = load(customModel((model) => ({
+      ...model,
+      endpoint: {
+        ...model.endpoint,
+        credential: { file: "custom.secret", environment: ["CUSTOM_API_KEY"] },
+      },
+    })));
+    assert.equal(doubled.status, 1);
+    assert.match(
+      doubled.stderr,
+      /must declare exactly one of anonymous, keyless, or credential/,
+    );
+
+    // The keyless rule is about the address, not the flag: an endpoint that
+    // sends no credential may only talk to this machine.
+    const offBox = load(customModel((model) => ({
+      ...model,
+      endpoint: { baseUrl: "https://example.com/v1", keyless: true },
+    })));
+    assert.equal(offBox.status, 1);
+    assert.match(offBox.stderr, /keyless endpoint must use a loopback baseUrl/);
+
+    // Identity is derived from the model. A fragment that set it could point
+    // one model's credential file at another model's secret.
+    const forged = load(customModel((model) => ({
+      ...model,
+      endpoint: { ...model.endpoint, id: "deepseek" },
+    })));
+    assert.equal(forged.status, 1);
+    assert.match(forged.stderr, /endpoint must not declare id or kind/);
+
+    // A container has no address of its own; two answers to "where does this
+    // go" would have a silent winner.
+    const addressedContainer = load((registry) => {
+      registry.providers = registry.providers.map((provider) =>
+        provider.id === "custom"
+          ? { ...provider, baseUrl: "https://example.com/v1" }
+          : provider,
+      );
+    });
+    assert.equal(addressedContainer.status, 1);
+    assert.match(
+      addressedContainer.stderr,
+      /per-model-endpoint provider custom must not declare baseUrl/,
+    );
+
+    // And the reverse: an endpoint on a provider that already is one would be
+    // silently ignored today and quietly obeyed after any future refactor.
+    const strayEndpoint = load((registry) => {
+      registry.models = registry.models.map((model) =>
+        model.provider === "deepseek"
+          ? { ...model, endpoint: { baseUrl: "https://example.com/v1" } }
+          : model,
+      );
+    });
+    assert.equal(strayEndpoint.status, 1);
+    assert.match(
+      strayEndpoint.stderr,
+      /declares an endpoint but deepseek is not a per-model-endpoint provider/,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -846,6 +1178,13 @@ test("local models route with Ollama's native protocol and a bounded context", (
   const rendered = renderLiteLlmConfig();
   const openAiRoutes = rendered.match(/model: "openai\/local-[^"]+"/g);
   assert.equal(openAiRoutes, null, "a local model must not use the OpenAI-compatible surface");
+  for (const block of rendered.matchAll(/model: "ollama_chat\/[^"]+"([\s\S]*?)(?=\n\s*- model_name:|\nlitellm_settings:)/g)) {
+    assert.match(
+      block[1],
+      /num_retries: 0/,
+      "a deterministic local rejection must not be repeated inside LiteLLM",
+    );
+  }
   // Every non-local model keeps the forwarder path untouched.
   assert.match(rendered, /model: "openai\/deepseek-v4-pro"/);
 });

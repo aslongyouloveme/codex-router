@@ -221,15 +221,15 @@ test("does not poll account endpoints for disabled providers", async () => {
 
 test("anonymous free providers degrade to traffic-only usage without a balance API", async () => {
   const snapshot = await providerAccountUsageSnapshot({
-    providerIds: ["opencode-free", "kilo-free"],
+    providerIds: ["opencode-free", "kilo-free", "custom"],
     fetchImpl: async () => {
       throw new Error("anonymous providers must not poll a private account endpoint");
     },
   });
-  assert.equal(snapshot["opencode-free"].status, "local-only");
-  assert.equal(snapshot["kilo-free"].status, "local-only");
-  assert.match(snapshot["opencode-free"].message, /quota is not exposed/);
-  assert.match(snapshot["kilo-free"].message, /quota is not exposed/);
+  for (const id of ["opencode-free", "kilo-free", "custom"]) {
+    assert.equal(snapshot[id].status, "local-only");
+    assert.match(snapshot[id].message, /quota is not exposed/);
+  }
 });
 
 test("Command Code usage keeps the pane traffic-only (quota lives in the key pool)", async () => {
@@ -732,6 +732,16 @@ test("normalizes Command Code plan windows and skips a zero resetAt", () => {
       weekly: { used: 0, cap: 6, exceeded: false, resetAt: 1_786_579_200_000 },
     },
   }), [
+    // The credit pool leads: a coding plan runs out of credits long before it
+    // stops hitting the windows, so it is the number that ends the afternoon.
+    {
+      kind: "balance",
+      label: "Plan credits",
+      value: 10,
+      currency: "USD",
+      detail: "Plan 10.00",
+      available: true,
+    },
     {
       kind: "quota",
       label: "5-hour limit",
@@ -754,6 +764,31 @@ test("normalizes Command Code plan windows and skips a zero resetAt", () => {
       resetAt: 1_786_579_200,
     },
   ]);
+});
+
+test("Command Code top-ups and a low-credit warning reach the balance metric", () => {
+  const [balance] = commandCodeCreditsMetrics({
+    credits: {
+      belowThreshold: true,
+      creditThreshold: 2,
+      monthlyCredits: 1.5,
+      purchasedCredits: 20,
+      freeCredits: 0.25,
+    },
+    windowLimits: { fiveHour: { used: 0, cap: 3 } },
+  });
+  assert.equal(balance.value, 21.75);
+  assert.equal(balance.detail, "Plan 1.50 · Purchased 20.00 · Free 0.25");
+  assert.equal(balance.available, false);
+});
+
+// Nothing to report is reported as nothing. A zero-valued balance would read
+// as an empty account rather than as an answer the provider did not give.
+test("Command Code windows without a credit pool report only the windows", () => {
+  assert.deepEqual(
+    commandCodeCreditsMetrics({ windowLimits: { weekly: { used: 1, cap: 6 } } }).map((m) => m.kind),
+    ["quota"],
+  );
 });
 
 test("normalizes Grok prepaid credits and pay-as-you-go balance", () => {

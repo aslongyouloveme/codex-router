@@ -55,12 +55,17 @@ sequenceDiagram
 The split registry tree under `config/` supplies the model mapping used by the
 catalog, router, gateway generator, API forwarder, and doctor.
 
-`enabled-providers.json` is a separate local policy. It controls both picker
-visibility and dispatcher access. A known namespaced model whose provider is
-hidden receives a local `provider_not_enabled` error; it is never mistaken for a
-native model or forwarded with Codex authentication. The policy is read on each
-external request, so provider visibility can change without restarting the
-service (Codex itself still needs a restart to reload the picker catalog).
+`enabled-providers.json` is a separate local policy owned by the router plane.
+It controls routed picker visibility and dispatcher access. `model-picker.json`
+stores the durable per-model decision, including explicit show choices, and the
+Codex, DeepSeek Harness, and Gemini publishers all consume that same state for
+external models. In a signed-in Codex install, the native GPT catalog and its
+base-entry visibility remain Codex-owned, so a router "hide all" action cannot
+erase the original native picker. A known namespaced model whose provider is hidden receives a local
+`provider_not_enabled` error; it is never mistaken for a native model or
+forwarded with Codex authentication. The policy is read on each external
+request, so provider visibility can change without restarting the service
+(Codex itself still needs a restart to reload the picker catalog).
 Catalog generation also requires a stored credential or valid OAuth session for
 each enabled external provider. Native GPT entries are included only when
 `codex login status` confirms an OpenAI login, so signed-out login-free users see
@@ -96,7 +101,6 @@ map, which restores native GPT routing.
 | Qwen3.7 Max Plan | `qwen-plan/qwen3.7-max` | `qwen-plan-qwen3-7-max` | `qwen3.7-max` |
 | Qwen3.7 Plus Plan | `qwen-plan/qwen3.7-plus` | `qwen-plan-qwen3-7-plus` | `qwen3.7-plus` |
 | GLM-5.3 Coding Plan | `zai-coding/glm-5.3` | `zai-coding-glm-5-3` | `glm-5.3` |
-| GLM-5.3 1M Coding Plan | `zai-coding/glm-5.3-1m` | `zai-coding-glm-5-3-1m` | `glm-5.3[1m]` |
 | GLM-5.2 Coding Plan | `zai-coding/glm-5.2` | `zai-coding-glm-5-2` | `glm-5.2` |
 | GLM-5-Turbo Coding Plan | `zai-coding/glm-5-turbo` | `zai-coding-glm-5-turbo` | `glm-5-turbo` |
 | GLM-5.3 Z.ai API | `zai-api/glm-5.3` | `zai-api-glm-5-3` | `glm-5.3` |

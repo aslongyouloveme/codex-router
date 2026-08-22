@@ -10,6 +10,7 @@ import path from "node:path";
 
 import { STATE_DIR } from "./paths.mjs";
 import { canonicalProviderId } from "./provider-selection.mjs";
+import { acceptedInputTokens } from "./context-window-drift.mjs";
 
 export const USAGE_EVENTS_PATH = path.join(STATE_DIR, "usage-events.jsonl");
 
@@ -79,8 +80,10 @@ export function recordUsageEvent({
   // separately as time-to-first-token.
   firstTokenMs,
   inputTokens,
+  billedInputTokens,
   cachedInputTokens,
   outputTokens,
+  billedOutputTokens,
   totalTokens,
   retries,
   // True when the upstream stream died after its 200 head was already
@@ -97,6 +100,11 @@ export function recordUsageEvent({
   // cover both attempts, because both were sent and both were billed. This
   // marker is what says the reported spend belongs to two attempts at one turn.
   emptyCompletionRetried,
+  // True when the Grok OAuth forwarder retried a progress-only stop. New rows
+  // keep the selected attempt in the ordinary token fields and the aggregate
+  // provider spend in billedInputTokens / billedOutputTokens. Historical rows
+  // summed both attempts into the ordinary fields.
+  progressOnlyRetried,
   // True when the turn was empty and the router could not repair it, because
   // the attempt had already been relayed: the upstream proved it was generating
   // before it produced nothing, so the hold was over and a retry would have
@@ -123,6 +131,20 @@ export function recordUsageEvent({
   toolResultBytesBefore,
   toolResultBytesAfter,
   toolResultBytesSaved,
+  // Present whenever the aging pass ran, even when it changed nothing. Every
+  // count above is omitted when zero, so without these an operator who enables
+  // aging and sees an empty ledger cannot tell whether the pass never ran or
+  // ran and found every result under the floor. `BytesLargest` separates the
+  // two: compare it against the eligibility floor.
+  toolResultsEvaluated,
+  toolResultBytesLargest,
+  // Present only on a turn the router moved to another model because the one
+  // the operator asked for reported it had no usage left. `model` and
+  // `provider` above name what actually served the turn; this names what was
+  // asked for. Without it a rescued turn is indistinguishable from an operator
+  // who simply changed models, which is the difference between "your provider
+  // is empty" and "you switched".
+  failoverFrom,
   at = Date.now(),
 }) {
   const event = {
@@ -141,6 +163,7 @@ export function recordUsageEvent({
     ...(streamAborted === true ? { streamAborted: true } : {}),
     ...(emptyCompletion === true ? { emptyCompletion: true } : {}),
     ...(emptyCompletionRetried === true ? { emptyCompletionRetried: true } : {}),
+    ...(progressOnlyRetried === true ? { progressOnlyRetried: true } : {}),
     ...(emptyCompletionUnrepairable === true
       ? { emptyCompletionUnrepairable: true }
       : {}),
@@ -148,14 +171,23 @@ export function recordUsageEvent({
       ? { emptyCompletionGuardReleased: true }
       : {}),
     ...(safeRetryCount(retries) !== undefined ? { retries: safeRetryCount(retries) } : {}),
+    ...(typeof failoverFrom === "string" && failoverFrom.trim()
+      ? { failoverFrom: safeText(failoverFrom, "unknown") }
+      : {}),
     ...(safeTokenCount(inputTokens) !== undefined
       ? { inputTokens: safeTokenCount(inputTokens) }
+      : {}),
+    ...(safeTokenCount(billedInputTokens) !== undefined
+      ? { billedInputTokens: safeTokenCount(billedInputTokens) }
       : {}),
     ...(safeTokenCount(cachedInputTokens) !== undefined
       ? { cachedInputTokens: safeTokenCount(cachedInputTokens) }
       : {}),
     ...(safeTokenCount(outputTokens) !== undefined
       ? { outputTokens: safeTokenCount(outputTokens) }
+      : {}),
+    ...(safeTokenCount(billedOutputTokens) !== undefined
+      ? { billedOutputTokens: safeTokenCount(billedOutputTokens) }
       : {}),
     ...(safeTokenCount(totalTokens) !== undefined
       ? { totalTokens: safeTokenCount(totalTokens) }
@@ -172,6 +204,14 @@ export function recordUsageEvent({
       : {}),
     ...(safeTokenCount(toolResultBytesSaved)
       ? { toolResultBytesSaved: safeTokenCount(toolResultBytesSaved) }
+      : {}),
+    // Zero is meaningful here -- it says the pass ran and saw no tool results
+    // at all -- so these are written whenever defined rather than when truthy.
+    ...(safeTokenCount(toolResultsEvaluated) !== undefined
+      ? { toolResultsEvaluated: safeTokenCount(toolResultsEvaluated) }
+      : {}),
+    ...(safeTokenCount(toolResultBytesLargest) !== undefined
+      ? { toolResultBytesLargest: safeTokenCount(toolResultBytesLargest) }
       : {}),
   };
   try {
@@ -219,6 +259,13 @@ function emptyRange(buckets) {
 export function toolResultAgingTotals({ now = Date.now() } = {}) {
   const totals = {
     requests: 0,
+    // Requests where the pass ran, whether or not it changed anything, plus the
+    // largest single result any of them saw. `evaluatedRequests` above zero
+    // with `requests` at zero is the signature of a workload whose results all
+    // sit under the eligibility floor: proof the pass is wired in, and the
+    // number that says by how much it missed.
+    evaluatedRequests: 0,
+    largestResultBytes: 0,
     resultsAged: 0,
     bytesSaved: 0,
     estimatedTokensSaved: 0,
@@ -234,7 +281,8 @@ export function toolResultAgingTotals({ now = Date.now() } = {}) {
   try {
     for (const line of usageEventLines()) {
       // Pre-filter: aging stats and cache telemetry are both rare fields.
-      const hasAging = line.includes('"toolResultsAged"');
+      const hasAging =
+        line.includes('"toolResultsAged"') || line.includes('"toolResultsEvaluated"');
       const hasCache = line.includes('"cachedInputTokens"');
       if (!hasAging && !hasCache) continue;
       let event;
@@ -244,6 +292,12 @@ export function toolResultAgingTotals({ now = Date.now() } = {}) {
         continue;
       }
       const at = typeof event?.at === "string" ? Date.parse(event.at) : NaN;
+      const evaluated = safeTokenCount(event?.toolResultsEvaluated);
+      if (evaluated !== undefined) {
+        totals.evaluatedRequests += 1;
+        const largest = safeTokenCount(event?.toolResultBytesLargest) ?? 0;
+        if (largest > totals.largestResultBytes) totals.largestResultBytes = largest;
+      }
       const resultsAged = safeTokenCount(event?.toolResultsAged);
       if (resultsAged) {
         totals.requests += 1;
@@ -293,13 +347,44 @@ export function toolResultAgingTotals({ now = Date.now() } = {}) {
   return totals;
 }
 
+// Every row writes `at` as `new Date(at).toISOString()`, and that fixed-width
+// UTC format sorts as text in the same order it sorts in time. Comparing the
+// raw substring lets a long window skip most of an append-only ledger without
+// parsing it, which is what makes filtering before capping affordable.
+const AT_FIELD = '"at":"';
+
+function lineOlderThan(line, cutoffIso) {
+  const start = line.indexOf(AT_FIELD);
+  if (start === -1) return false;
+  const from = start + AT_FIELD.length;
+  const end = line.indexOf('"', from);
+  if (end === -1) return false;
+  const at = line.slice(from, end);
+  // Only the canonical toISOString() shape compares correctly as text. Anything
+  // else is left for the authoritative Date.parse check, which still runs.
+  if (at.length !== cutoffIso.length || at[at.length - 1] !== "Z") return false;
+  return at < cutoffIso;
+}
+
 export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000 } = {}) {
   if (!existsSync(USAGE_EVENTS_PATH)) return [];
   const cutoff = Date.now() - sinceMs;
+  let cutoffIso = "";
   try {
-    return usageEventLines()
+    cutoffIso = new Date(cutoff).toISOString();
+  } catch {
+    // An out-of-range window has no text form; the parse-time check covers it.
+    cutoffIso = "";
+  }
+  try {
+    const events = usageEventLines()
       .filter(Boolean)
-      .slice(-Math.max(1, limit))
+      // The window is applied BEFORE the cap, never after. Capping first spent
+      // the budget on rows the window then threw away, so a long read on a busy
+      // install silently lost its oldest days: at ~6k events/day the 100k cap a
+      // 90-day snapshot passes covers barely two weeks of ledger, and the
+      // missing remainder looked exactly like an idle month.
+      .filter((line) => !cutoffIso || !lineOlderThan(line, cutoffIso))
       .map((line) => {
         try {
           return JSON.parse(line);
@@ -315,10 +400,17 @@ export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000
           typeof event.model === "string" &&
           typeof event.provider === "string",
       )
+      // Cap the kept events, keeping the most recent ones, so the limit bounds
+      // the answer rather than the search. Infinity is an explicit opt-in for
+      // consumers such as the retained-lifetime ledger that must not silently
+      // drop older rows.
+      .slice(Number.isFinite(limit) ? -Math.max(1, limit) : undefined)
       .map((event) => {
         const inputTokens = safeTokenCount(event.inputTokens);
+        const billedInputTokens = safeTokenCount(event.billedInputTokens);
         const cachedInputTokens = safeTokenCount(event.cachedInputTokens);
         const outputTokens = safeTokenCount(event.outputTokens);
+        const billedOutputTokens = safeTokenCount(event.billedOutputTokens);
         const totalTokens = safeTokenCount(event.totalTokens);
         const retries = safeRetryCount(event.retries);
         const estimatedInputTokens = safeTokenCount(event.estimatedInputTokens);
@@ -352,13 +444,16 @@ export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000
           ...(event.emptyCompletionRetried === true
             ? { emptyCompletionRetried: true }
             : {}),
+          ...(event.progressOnlyRetried === true ? { progressOnlyRetried: true } : {}),
           ...(event.emptyCompletionGuardReleased === true
             ? { emptyCompletionGuardReleased: true }
             : {}),
           ...(retries !== undefined ? { retries } : {}),
           ...(inputTokens !== undefined ? { inputTokens } : {}),
+          ...(billedInputTokens !== undefined ? { billedInputTokens } : {}),
           ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
           ...(outputTokens !== undefined ? { outputTokens } : {}),
+          ...(billedOutputTokens !== undefined ? { billedOutputTokens } : {}),
           ...(totalTokens !== undefined ? { totalTokens } : {}),
           ...(estimatedInputTokens !== undefined ? { estimatedInputTokens } : {}),
           ...(toolResultsAged ? { toolResultsAged } : {}),
@@ -367,7 +462,44 @@ export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000
           ...(toolResultBytesSaved ? { toolResultBytesSaved } : {}),
         };
       });
+    return events;
   } catch {
     return [];
   }
+}
+
+// The append-only ledger is the source of truth for "everything this router
+// has observed". Keep this separate from recentUsageEvents' bounded default so
+// callers have to opt into the potentially larger read explicitly.
+export function allUsageEvents({ limit = Number.POSITIVE_INFINITY } = {}) {
+  return recentUsageEvents({ sinceMs: Number.POSITIVE_INFINITY, limit });
+}
+
+// Highest prompt each model has been observed to have accepted, scanned across
+// the whole ledger rather than a recent window: the turn that disproves a
+// declared context window may be months old and must not age out of the
+// evidence. Streamed line by line with a cheap pre-filter, because the ledger
+// only grows and parsing every row to find a maximum is wasteful.
+export function observedInputCeilings() {
+  const highest = new Map();
+  if (!existsSync(USAGE_EVENTS_PATH)) return highest;
+  try {
+    for (const line of usageEventLines()) {
+      if (!line.includes('"inputTokens"')) continue;
+      // A substituted estimate cannot disprove a provider's own limit.
+      if (line.includes('"estimatedInputTokens"')) continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const accepted = acceptedInputTokens(event);
+      if (accepted === undefined) continue;
+      if (accepted > (highest.get(event.model) ?? 0)) highest.set(event.model, accepted);
+    }
+  } catch {
+    // Telemetry must never break a status surface; report what was readable.
+  }
+  return highest;
 }

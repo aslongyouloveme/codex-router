@@ -9,6 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const CONTROL_TIMEOUT_MS = 120_000;
+const CATALOG_MUTATION_TIMEOUT_MS = 330_000;
 
 const SELF_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -71,6 +72,9 @@ export const COMMANDS = {
   set_local_model_enabled: ({ model, tag, enabled }) => ({
     args: ["local-models", "set", requireTag(model ?? tag), enabled ? "on" : "off"],
   }),
+  set_lmstudio_model_enabled: ({ model, id, enabled }) => ({
+    args: ["local-models", "lmstudio-set", requireTag(model ?? id), enabled ? "on" : "off"],
+  }),
   install_provider_cli: ({ provider }) => ({ args: ["install-cli", requireProvider(provider)] }),
   connect_oauth: ({ provider }) => ({
     args: ["login", requireProvider(provider)],
@@ -82,16 +86,25 @@ export const COMMANDS = {
     return {
       args: ["credential", requireProvider(provider)],
       stdin: String(apiKey),
-      select: [["set", requireProvider(provider), "on", "--targets", "codex"]],
+      timeoutMs: CATALOG_MUTATION_TIMEOUT_MS,
       then: ["providers", "--json"],
     };
   },
   remove_api_key: ({ provider }) => ({
     args: ["credential", requireProvider(provider), "--remove"],
+    timeoutMs: CATALOG_MUTATION_TIMEOUT_MS,
     then: ["providers", "--json"],
   }),
   set_provider_enabled: ({ provider, enabled }) => ({
-    args: ["set", requireProvider(provider), enabled ? "on" : "off", "--targets", "codex"],
+    args: [
+      "set-apply",
+      requireProvider(provider),
+      enabled ? "on" : "off",
+      "--targets",
+      "codex",
+      "--activate",
+    ],
+    timeoutMs: CATALOG_MUTATION_TIMEOUT_MS,
     then: ["--json"],
   }),
   set_login_free: ({ enabled }) => ({
@@ -168,7 +181,11 @@ function which(name, env) {
   return undefined;
 }
 
-export function runControl(root, args, { stdin, runtime = nodeRuntime() } = {}) {
+export function runControl(
+  root,
+  args,
+  { stdin, runtime = nodeRuntime(), timeoutMs = CONTROL_TIMEOUT_MS } = {},
+) {
   return new Promise((resolve, reject) => {
     if (!root) {
       reject(new Error("Model Router was not found. Set MODEL_ROUTER_SOURCE_ROOT."));
@@ -180,7 +197,7 @@ export function runControl(root, args, { stdin, runtime = nodeRuntime() } = {}) 
       {
         cwd: root,
         env: runtime.env,
-        timeout: CONTROL_TIMEOUT_MS,
+        timeout: timeoutMs,
         maxBuffer: 32 * 1024 * 1024,
         windowsHide: true,
       },
@@ -213,8 +230,10 @@ export async function runDesktopCommand(command, args = {}, { root = sourceRoot(
   const build = COMMANDS[command];
   if (!build) throw new Error(`Unknown command: ${command}`);
   const plan = build(args ?? {});
-  const output = await runControl(root, plan.args, { stdin: plan.stdin });
-  for (const extra of plan.select ?? []) await runControl(root, extra);
+  const output = await runControl(root, plan.args, {
+    stdin: plan.stdin,
+    timeoutMs: plan.timeoutMs,
+  });
   if (plan.then) return parseJson(await runControl(root, plan.then));
   return output.trim() ? parseJson(output) : null;
 }
