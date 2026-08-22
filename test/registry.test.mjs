@@ -1226,7 +1226,10 @@ test("opencode's DeepSeek models never receive a forced tool_choice", () => {
   // while calling tools correctly under "auto" — both halves observed live on
   // 2026-08-15. Per AGENTS.md that is exactly the per-model auto-tool-choice
   // case: the restriction belongs to the upstream behind the reseller, so the
-  // router downgrades the forced choice for these two slugs and no others.
+  // router downgrades the forced choice for these slugs and no others.
+  // deepseek-v4-flash/pro additionally force reasoning effort to max on their
+  // chat route, hence the dedicated deepseek-force-max-auto-tool-choice
+  // profile (which also normalizes a forced tool choice to "auto").
   for (const slug of [
     "opencode-go/deepseek-v4-flash",
     "opencode-go/deepseek-v4-pro",
@@ -1239,7 +1242,11 @@ test("opencode's DeepSeek models never receive a forced tool_choice", () => {
     "opencode-go-messages/qwen3.7-plus",
     "opencode-go-messages/qwen3.8-max",
   ]) {
-    assert.equal(MODEL_BY_SLUG.get(slug).requestProfile, "auto-tool-choice", slug);
+    const profile = MODEL_BY_SLUG.get(slug).requestProfile;
+    assert.ok(
+      ["auto-tool-choice", "deepseek-force-max-auto-tool-choice"].includes(profile),
+      `${slug}: ${profile}`,
+    );
   }
   // The sibling opencode routes keep their defaults: the probe proved nothing
   // about them, and a provider-wide default is what the rule forbids. (kimi-k3

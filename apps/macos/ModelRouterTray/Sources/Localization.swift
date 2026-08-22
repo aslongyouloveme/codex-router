@@ -134,6 +134,9 @@ func routerFormat(_ english: String, _ arguments: CVarArg...) -> String {
 enum RouterChineseText {
   static let values: [String: String] = [
     "Uninstalling": "正在卸载",
+    "Command Code key pool": "Command Code 密钥池",
+    "Command Code usage": "Command Code 用量",
+    "Loading pool usage…": "正在加载密钥池用量…",
     "Off by default · replaces consumed tool results on external models": "默认关闭 · 在外部模型上替换已使用的工具结果",
     "Fix Codex Router installation": "修复 Codex 路由安装",
     "Language": "语言",

@@ -506,6 +506,16 @@ test("merged catalog supplies the required native parallel-tool capability", () 
   const native = { ...template };
   delete native.supports_parallel_tool_calls;
   const merged = buildMergedCatalog({ models: [native] }, []);
+  // The conservative default: an absent native declaration is false unless
+  // the compat table (gpt-5.2) says otherwise. Recent Codex clients require
+  // the field to be present, not true.
+  assert.equal(merged[0].supports_parallel_tool_calls, false);
+});
+
+test("the parallel-tool compat table keeps gpt-5.2 eligible", () => {
+  const native = { ...template, slug: "gpt-5.2" };
+  delete native.supports_parallel_tool_calls;
+  const merged = buildMergedCatalog({ models: [native] }, []);
   assert.equal(merged[0].supports_parallel_tool_calls, true);
 });
 
